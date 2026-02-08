@@ -16,8 +16,8 @@ pub const zero_hash: MerkleHash = [_]u8{0} ** 32;
 
 /// BLAKE3 key for hashing leaf/chunk data (from xet-core merklehash/src/data_hash.rs).
 pub const DATA_KEY: [32]u8 = .{
-    102, 151, 245, 119, 91,  149, 80,  222, 49,  53,  203, 172, 165, 151, 24, 28,
-    157, 228, 33,  16,  155, 235, 43,  88,  180, 208, 176, 75,  147, 173, 242, 41,
+    102, 151, 245, 119, 91,  149, 80, 222, 49,  53,  203, 172, 165, 151, 24,  28,
+    157, 228, 33,  16,  155, 235, 43, 88,  180, 208, 176, 75,  147, 173, 242, 41,
 };
 
 /// BLAKE3 key for combining internal tree nodes (from xet-core merklehash/src/data_hash.rs).

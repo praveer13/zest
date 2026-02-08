@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Build (Debug)
+        run: zig build
+
+      - name: Run tests
+        run: zig build test --summary all
+
+      - name: Build (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Smoke test CLI
+        run: |
+          ./zig-out/bin/zest version
+          ./zig-out/bin/zest help
+
+      - name: Binary size
+        run: |
+          ls -lh zig-out/bin/zest
+          echo "BINARY_SIZE=$(stat --format=%s zig-out/bin/zest 2>/dev/null || stat -f%z zig-out/bin/zest)" >> "$GITHUB_ENV"
+
+      - name: Upload binary
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: zest-${{ matrix.os }}
+          path: zig-out/bin/zest
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Check formatting
+        run: zig fmt --check src/
+
+  metrics:
+    name: Metrics
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lines of code
+        run: |
+          echo "## Code Metrics" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Module | Lines |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|------:|" >> "$GITHUB_STEP_SUMMARY"
+          for f in src/*.zig; do
+            name=$(basename "$f")
+            lines=$(wc -l < "$f")
+            echo "| \`$name\` | $lines |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          total=$(cat src/*.zig | wc -l)
+          echo "| **Total** | **$total** |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Test count
+        run: |
+          count=$(grep -c 'test "' src/*.zig | awk -F: '{s+=$2} END {print s}')
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Tests:** $count test blocks across $(grep -l 'test \"' src/*.zig | wc -l) files" >> "$GITHUB_STEP_SUMMARY"
