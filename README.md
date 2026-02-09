@@ -2,7 +2,7 @@
 
 **P2P acceleration for ML model distribution.**
 
-[![Zig](https://img.shields.io/badge/Zig-0.13.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
+[![Zig](https://img.shields.io/badge/Zig-0.14.1-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
 [![Tests](https://img.shields.io/badge/tests-16%20passing-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
 [![Lines of Code](https://img.shields.io/badge/lines-2%2C007-informational)](#project-structure)
@@ -29,7 +29,7 @@ When a popular model drops, tens of thousands of people download the same immuta
 
 ### From source
 
-Requires [Zig 0.13.0](https://ziglang.org/download/).
+Requires [Zig 0.14.1](https://ziglang.org/download/).
 
 ```bash
 git clone https://github.com/praveer13/zest.git
@@ -41,7 +41,7 @@ zig build -Doptimize=ReleaseFast
 ### Quick install (pip)
 
 ```bash
-pip install ziglang==0.13.0
+pip install ziglang==0.14.1
 git clone https://github.com/praveer13/zest.git && cd zest
 zig build -Doptimize=ReleaseFast
 sudo cp zig-out/bin/zest /usr/local/bin/
