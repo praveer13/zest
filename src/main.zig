@@ -4,63 +4,70 @@
 ///   zest pull <repo_id> [--revision <ref>] [--tracker <url>]
 ///   zest seed [--tracker <url>]
 ///
-/// Pull downloads a model from HuggingFace using the Xet protocol,
+/// Pull downloads a model from HuggingFace using the Xet protocol (via zig-xet),
 /// with P2P acceleration when peers are available.
 /// Seed announces locally cached xorbs to the tracker for other peers.
 const std = @import("std");
+const Io = std.Io;
+const xet = @import("xet");
 const config = @import("config.zig");
-const hub = @import("hub.zig");
-const cas = @import("cas.zig");
-const cdn = @import("cdn.zig");
-const reconstruct = @import("reconstruct.zig");
 const swarm = @import("swarm.zig");
 const storage = @import("storage.zig");
 const tracker = @import("tracker.zig");
 
-const version = "0.1.0";
+const version = "0.2.0";
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    // Setup I/O writers
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_fw: Io.File.Writer = .init(.stdout(), io, &stdout_buf);
+    const stdout = &stdout_fw.interface;
+
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr_fw: Io.File.Writer = .init(.stderr(), io, &stderr_buf);
+    const stderr = &stderr_fw.interface;
+
+    defer {
+        stdout.flush() catch {};
+        stderr.flush() catch {};
+    }
+
+    // Get args
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
-        printUsage();
+        printUsage(stdout);
         return;
     }
 
     const command = args[1];
 
     if (std.mem.eql(u8, command, "pull")) {
-        try cmdPull(allocator, args[2..]);
+        try cmdPull(allocator, init, stdout, stderr, args[2..]);
     } else if (std.mem.eql(u8, command, "seed")) {
-        try cmdSeed(allocator, args[2..]);
+        try cmdSeed(allocator, io, init.minimal.environ, stdout, stderr, args[2..]);
     } else if (std.mem.eql(u8, command, "version")) {
-        const stdout = std.io.getStdOut().writer();
         try stdout.print("zest {s}\n", .{version});
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
-        printUsage();
+        printUsage(stdout);
     } else {
-        const stderr = std.io.getStdErr().writer();
         try stderr.print("Unknown command: {s}\n\n", .{command});
-        printUsage();
+        printUsage(stdout);
     }
 }
 
-fn cmdPull(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    const stdout = std.io.getStdOut().writer();
-    const stderr = std.io.getStdErr().writer();
-
+fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Writer, stderr: *Io.Writer, args: []const [:0]const u8) !void {
     if (args.len < 1) {
         try stderr.print("Error: missing repository ID\n", .{});
         try stderr.print("Usage: zest pull <repo_id> [--revision <ref>] [--tracker <url>]\n", .{});
         return;
     }
 
-    const repo_id = args[0];
+    const io = init.io;
+    const repo_id: []const u8 = args[0];
     var revision: []const u8 = config.default_revision;
     var tracker_url: ?[]const u8 = null;
 
@@ -79,94 +86,90 @@ fn cmdPull(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try stdout.print("zest pull {s} (revision: {s})\n", .{ repo_id, revision });
 
     // Initialize config
-    var cfg = try config.Config.init(allocator);
+    const environ = init.minimal.environ;
+    var cfg = try config.Config.init(allocator, io, environ);
     defer cfg.deinit();
 
     if (cfg.hf_token == null) {
         try stderr.print("Warning: no HuggingFace token found. Set HF_TOKEN or run `huggingface-cli login`.\n", .{});
     }
 
-    // Step 1: Get repo info from HF Hub
+    // Step 1: List files from HF Hub via zig-xet
     try stdout.print("Fetching model info from HuggingFace Hub...\n", .{});
-    var hub_client = hub.HubClient.init(allocator, &cfg);
-    defer hub_client.deinit();
+    try stdout.flush();
 
-    var repo_info = hub_client.getRepoInfo(repo_id, revision) catch |err| {
-        try stderr.print("Error fetching repo info: {}\n", .{err});
+    var file_list = xet.model_download.listFiles(
+        allocator,
+        io,
+        environ,
+        repo_id,
+        "model",
+        revision,
+        cfg.hf_token,
+    ) catch |err| {
+        try stderr.print("Error listing files: {}\n", .{err});
         return err;
     };
-    defer repo_info.deinit();
+    defer file_list.deinit();
 
-    const commit = repo_info.commit_sha orelse revision;
-    try stdout.print("Found {d} files (commit: {s})\n", .{ repo_info.files.len, commit });
+    const commit = revision;
+    try stdout.print("Found {d} files (revision: {s})\n", .{ file_list.files.len, commit });
 
-    // Step 2: Probe files for Xet support
+    // Step 2: Detect Xet files
     try stdout.print("Detecting Xet-backed files...\n", .{});
-    hub_client.probeAllFiles(&repo_info) catch |err| {
-        try stderr.print("Warning: failed to probe Xet files: {}\n", .{err});
-    };
-
     var xet_count: usize = 0;
-    var total_size: u64 = 0;
-    for (repo_info.files) |file| {
+    for (file_list.files) |file| {
         if (file.xet_hash != null) xet_count += 1;
-        total_size += file.size;
     }
-    try stdout.print("  {d} Xet-backed files, {d} total files, {d} bytes total\n", .{ xet_count, repo_info.files.len, total_size });
+    try stdout.print("  {d} Xet-backed files, {d} total files\n", .{ xet_count, file_list.files.len });
 
-    // Step 3: Initialize CAS client
-    var cas_client = cas.CasClient.init(allocator, &cfg);
-    defer cas_client.deinit();
-
-    // Step 4: Initialize swarm downloader
-    var downloader = try swarm.SwarmDownloader.init(allocator, &cfg, tracker_url);
+    // Step 3: Initialize swarm downloader (for P2P when available)
+    var downloader = try swarm.SwarmDownloader.init(allocator, io, &cfg, tracker_url);
     defer downloader.deinit();
 
-    // Step 5: Download and reconstruct each file
+    // Step 4: Download and reconstruct each file
     var files_done: usize = 0;
-    for (repo_info.files) |file| {
+    for (file_list.files) |file| {
         files_done += 1;
-        try stdout.print("[{d}/{d}] {s}", .{ files_done, repo_info.files.len, file.path });
+        try stdout.print("[{d}/{d}] {s}", .{ files_done, file_list.files.len, file.path });
 
-        const output_path = try reconstruct.buildOutputPath(allocator, &cfg, repo_id, commit, file.path);
+        const output_path = try buildOutputPath(allocator, &cfg, repo_id, commit, file.path);
         defer allocator.free(output_path);
 
         // Check if already downloaded
-        if (std.fs.accessAbsolute(output_path, .{})) |_| {
+        if (Io.Dir.accessAbsolute(io, output_path, .{})) |_| {
             try stdout.print(" (cached)\n", .{});
             continue;
         } else |_| {}
 
-        if (file.xet_hash) |xet_hash| {
+        if (file.xet_hash) |xet_hash_hex| {
             try stdout.print(" [xet]\n", .{});
+            try stdout.flush();
 
-            // Query CAS for reconstruction terms
-            var recon = cas_client.getReconstructionInfo(xet_hash) catch |err| {
-                try stderr.print("  Error querying CAS: {}\n", .{err});
-                continue;
-            };
-            defer recon.deinit();
+            // Use zig-xet to download the file via Xet protocol.
+            try ensureParentDirs(io, output_path);
 
-            try stdout.print("  {d} terms, {d} bytes\n", .{ recon.terms.len, recon.file_size });
-
-            // Download xorbs via swarm (peers + CDN fallback)
-            downloader.downloadXorbs(&recon) catch |err| {
-                try stderr.print("  Error downloading xorbs: {}\n", .{err});
-                continue;
+            const dl_config = xet.model_download.DownloadConfig{
+                .repo_id = repo_id,
+                .revision = revision,
+                .file_hash_hex = xet_hash_hex,
+                .hf_token = cfg.hf_token,
             };
 
-            // Reconstruct the file
-            var cdn_dl = cdn.CdnDownloader.init(allocator);
-            defer cdn_dl.deinit();
-            reconstruct.reconstructFile(allocator, &cfg, &recon, output_path, &cdn_dl) catch |err| {
-                try stderr.print("  Error reconstructing file: {}\n", .{err});
+            xet.model_download.downloadModelToFile(
+                allocator,
+                io,
+                environ,
+                dl_config,
+                output_path,
+            ) catch |err| {
+                try stderr.print("  Error downloading via xet: {}\n", .{err});
                 continue;
             };
         } else {
             try stdout.print(" [regular]\n", .{});
-            // For non-Xet files, download directly via HTTP
-            // (small config/tokenizer files are typically not Xet-backed)
-            downloadRegularFile(allocator, &cfg, repo_id, revision, file.path, output_path) catch |err| {
+            try stdout.flush();
+            downloadRegularFile(allocator, io, repo_id, revision, file.path, output_path) catch |err| {
                 try stderr.print("  Error downloading: {}\n", .{err});
                 continue;
             };
@@ -178,7 +181,7 @@ fn cmdPull(allocator: std.mem.Allocator, args: []const []const u8) !void {
         try stderr.print("Warning: failed to write ref: {}\n", .{err});
     };
 
-    downloader.printStats();
+    downloader.printStats(stdout);
     try stdout.print("\nDone! Model available at:\n", .{});
 
     const snapshot_dir = try cfg.modelSnapshotDir(repo_id, commit);
@@ -187,10 +190,7 @@ fn cmdPull(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try stdout.print("\nRun: transformers.AutoModel.from_pretrained(\"{s}\")\n", .{repo_id});
 }
 
-fn cmdSeed(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    const stdout = std.io.getStdOut().writer();
-    const stderr = std.io.getStdErr().writer();
-
+fn cmdSeed(allocator: std.mem.Allocator, io: Io, environ: std.process.Environ, stdout: *Io.Writer, stderr: *Io.Writer, args: []const [:0]const u8) !void {
     var tracker_url: ?[]const u8 = null;
     var listen_addr: []const u8 = "0.0.0.0:6881";
 
@@ -210,7 +210,7 @@ fn cmdSeed(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return;
     }
 
-    var cfg = try config.Config.init(allocator);
+    var cfg = try config.Config.init(allocator, io, environ);
     defer cfg.deinit();
 
     try stdout.print("Scanning local xorb cache...\n", .{});
@@ -228,17 +228,17 @@ fn cmdSeed(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     // Announce to tracker
-    var tracker_client = try tracker.TrackerClient.init(allocator, tracker_url.?);
+    var tracker_client = try tracker.TrackerClient.init(allocator, io, tracker_url.?);
     defer tracker_client.deinit();
 
     // Convert to fixed-size hash array
-    var hash_hexes = std.ArrayList([64]u8).init(allocator);
-    defer hash_hexes.deinit();
+    var hash_hexes: std.ArrayList([64]u8) = .empty;
+    defer hash_hexes.deinit(allocator);
     for (cached) |h| {
         if (h.len == 64) {
             var hex: [64]u8 = undefined;
             @memcpy(&hex, h);
-            try hash_hexes.append(hex);
+            try hash_hexes.append(allocator, hex);
         }
     }
 
@@ -251,9 +251,29 @@ fn cmdSeed(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try stdout.print("Seeding from {s}\n", .{listen_addr});
 }
 
+/// Build the output path for a file in the HF cache layout.
+fn buildOutputPath(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+    repo_id: []const u8,
+    commit: []const u8,
+    file_path: []const u8,
+) ![]u8 {
+    const snapshot_dir = try cfg.modelSnapshotDir(repo_id, commit);
+    defer allocator.free(snapshot_dir);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ snapshot_dir, file_path });
+}
+
+/// Ensure all parent directories in a path exist.
+fn ensureParentDirs(io: Io, path: []const u8) !void {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| {
+        try storage.ensureDirRecursive(io, path[0..sep]);
+    }
+}
+
 fn downloadRegularFile(
     allocator: std.mem.Allocator,
-    _: *const config.Config,
+    io: Io,
     repo_id: []const u8,
     revision: []const u8,
     file_path: []const u8,
@@ -266,19 +286,27 @@ fn downloadRegularFile(
     );
     defer allocator.free(url);
 
-    var downloader = cdn.CdnDownloader.init(allocator);
-    defer downloader.deinit();
+    var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer http_client.deinit();
 
-    var result = try downloader.downloadXorb(url);
-    defer result.deinit();
+    var aw: Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
-    try reconstruct.ensureParentDirs(output_path);
-    try storage.writeFileAtomic(output_path, result.data);
+    const result = http_client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &aw.writer,
+    }) catch return error.HttpError;
+
+    if (result.status != .ok) {
+        return error.HttpError;
+    }
+
+    try ensureParentDirs(io, output_path);
+    try storage.writeFileAtomic(io, output_path, aw.written());
 }
 
-fn printUsage() void {
-    const stdout = std.io.getStdOut().writer();
-    stdout.print(
+fn printUsage(w: *Io.Writer) void {
+    w.print(
         \\zest — P2P acceleration for ML model distribution
         \\
         \\Usage:

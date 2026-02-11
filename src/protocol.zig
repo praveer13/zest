@@ -8,8 +8,8 @@
 ///   0x04 HaveXorbs      — announce which xorbs this peer has
 ///   0x05 PeerExchange   — share known peers
 const std = @import("std");
-const hash_mod = @import("hash.zig");
-const MerkleHash = hash_mod.MerkleHash;
+const Io = std.Io;
+const MerkleHash = [32]u8;
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024 + 1024; // 64 MiB + overhead
@@ -69,35 +69,32 @@ pub fn serialize(comptime T: type, value: *const T) [@sizeOf(T)]u8 {
 /// Deserialize bytes to a fixed-size struct.
 pub fn deserialize(comptime T: type, buf: []const u8) !T {
     if (buf.len < @sizeOf(T)) return error.BufferTooSmall;
-    const ptr: *const T = @ptrCast(@alignCast(buf[0..@sizeOf(T)]));
-    return ptr.*;
+    return std.mem.bytesToValue(T, buf[0..@sizeOf(T)]);
 }
 
 /// Write a length-prefixed, type-tagged message to a writer.
-pub fn writeMessage(writer: anytype, msg_type: MessageType, payload: []const u8) !void {
+pub fn writeMessage(writer: *Io.Writer, msg_type: MessageType, payload: []const u8) !void {
     const total_len: u32 = @intCast(1 + payload.len); // 1 for type tag
-    try writer.writeInt(u32, total_len, .little);
+    const len_bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, total_len));
+    try writer.writeAll(&len_bytes);
     try writer.writeByte(@intFromEnum(msg_type));
     try writer.writeAll(payload);
 }
 
 /// Read a length-prefixed, type-tagged message. Returns (type, payload).
-pub fn readMessage(reader: anytype, allocator: std.mem.Allocator) !struct { msg_type: MessageType, payload: []u8 } {
-    const total_len = try reader.readInt(u32, .little);
+pub fn readMessage(reader: *Io.Reader, allocator: std.mem.Allocator) !struct { msg_type: MessageType, payload: []u8 } {
+    const len_bytes = try reader.takeArray(4);
+    const total_len = std.mem.readInt(u32, len_bytes, .little);
     if (total_len < 1 or total_len > MAX_MESSAGE_SIZE) return error.InvalidMessageSize;
 
-    const type_byte = try reader.readByte();
-    const msg_type = std.meta.intToEnum(MessageType, type_byte) catch return error.UnknownMessageType;
+    const type_byte = try reader.takeByte();
+    const msg_type: MessageType = @enumFromInt(type_byte);
 
-    const payload_len = total_len - 1;
+    const payload_len: usize = total_len - 1;
     const payload = try allocator.alloc(u8, payload_len);
     errdefer allocator.free(payload);
 
-    const bytes_read = try reader.readAll(payload);
-    if (bytes_read != payload_len) {
-        allocator.free(payload);
-        return error.IncompleteMessage;
-    }
+    try reader.readSliceAll(payload);
 
     return .{ .msg_type = msg_type, .payload = payload };
 }
@@ -130,13 +127,13 @@ test "serialize and deserialize XorbRequest" {
 
 test "writeMessage and readMessage roundtrip" {
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var writer: Io.Writer = .fixed(&buf);
 
     const payload = "hello peer";
-    try writeMessage(stream.writer(), .handshake, payload);
+    try writeMessage(&writer, .handshake, payload);
 
-    stream.pos = 0;
-    const msg = try readMessage(stream.reader(), std.testing.allocator);
+    var reader: Io.Reader = .fixed(writer.buffered());
+    const msg = try readMessage(&reader, std.testing.allocator);
     defer std.testing.allocator.free(msg.payload);
 
     try std.testing.expectEqual(MessageType.handshake, msg.msg_type);

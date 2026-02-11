@@ -3,27 +3,32 @@
 /// Handles TCP connections to peers, the handshake flow, and requesting/receiving
 /// xorb data. Each peer connection is a simple request-response protocol over TCP.
 const std = @import("std");
+const Io = std.Io;
+const net = Io.net;
 const protocol = @import("protocol.zig");
-const hash_mod = @import("hash.zig");
 
 pub const PeerConnection = struct {
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    io: Io,
+    stream: net.Stream,
     peer_id: ?[32]u8,
-    peer_addr: std.net.Address,
+    read_buf: [8192]u8,
+    write_buf: [8192]u8,
 
-    pub fn connect(allocator: std.mem.Allocator, address: std.net.Address) !PeerConnection {
-        const stream = try std.net.tcpConnectToAddress(address);
+    pub fn connect(allocator: std.mem.Allocator, io: Io, address: net.IpAddress) !PeerConnection {
+        const stream = try address.connect(io, .{ .mode = .nonblocking });
         return .{
             .allocator = allocator,
+            .io = io,
             .stream = stream,
             .peer_id = null,
-            .peer_addr = address,
+            .read_buf = undefined,
+            .write_buf = undefined,
         };
     }
 
     pub fn deinit(self: *PeerConnection) void {
-        self.stream.close();
+        self.stream.close(self.io);
     }
 
     /// Perform the handshake with the remote peer.
@@ -34,10 +39,14 @@ pub const PeerConnection = struct {
             .num_xorbs = num_xorbs,
         };
         const payload = protocol.serialize(protocol.Handshake, &hs);
-        try protocol.writeMessage(self.stream.writer(), .handshake, &payload);
+
+        var sw = self.stream.writer(self.io, &self.write_buf);
+        try protocol.writeMessage(&sw.interface, .handshake, &payload);
+        try sw.interface.flush();
 
         // Read peer's handshake
-        const msg = try protocol.readMessage(self.stream.reader(), self.allocator);
+        var sr = self.stream.reader(self.io, &self.read_buf);
+        const msg = try protocol.readMessage(&sr.interface, self.allocator);
         defer self.allocator.free(msg.payload);
 
         if (msg.msg_type != .handshake) return error.UnexpectedMessage;
@@ -48,15 +57,19 @@ pub const PeerConnection = struct {
     }
 
     /// Request a xorb from the peer by hash.
-    pub fn requestXorb(self: *PeerConnection, xorb_hash: hash_mod.MerkleHash) ![]u8 {
+    pub fn requestXorb(self: *PeerConnection, xorb_hash: [32]u8) ![]u8 {
         const req = protocol.XorbRequest{
             .xorb_hash = xorb_hash,
         };
         const payload = protocol.serialize(protocol.XorbRequest, &req);
-        try protocol.writeMessage(self.stream.writer(), .xorb_request, &payload);
+
+        var sw = self.stream.writer(self.io, &self.write_buf);
+        try protocol.writeMessage(&sw.interface, .xorb_request, &payload);
+        try sw.interface.flush();
 
         // Read response
-        const msg = try protocol.readMessage(self.stream.reader(), self.allocator);
+        var sr = self.stream.reader(self.io, &self.read_buf);
+        const msg = try protocol.readMessage(&sr.interface, self.allocator);
 
         if (msg.msg_type != .xorb_data) {
             self.allocator.free(msg.payload);
@@ -85,31 +98,25 @@ pub const PeerConnection = struct {
     }
 
     /// Send our list of available xorbs to the peer.
-    pub fn sendHaveXorbs(self: *PeerConnection, xorb_hashes: []const hash_mod.MerkleHash) !void {
-        var payload = std.ArrayList(u8).init(self.allocator);
-        defer payload.deinit();
+    pub fn sendHaveXorbs(self: *PeerConnection, xorb_hashes: []const [32]u8) !void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
 
         const header = protocol.HaveXorbs{ .count = @intCast(xorb_hashes.len) };
         const header_bytes = protocol.serialize(protocol.HaveXorbs, &header);
-        try payload.appendSlice(&header_bytes);
+        try payload.appendSlice(self.allocator, &header_bytes);
 
         for (xorb_hashes) |h| {
-            try payload.appendSlice(&h);
+            try payload.appendSlice(self.allocator, &h);
         }
 
-        try protocol.writeMessage(self.stream.writer(), .have_xorbs, payload.items);
+        var sw = self.stream.writer(self.io, &self.write_buf);
+        try protocol.writeMessage(&sw.interface, .have_xorbs, payload.items);
+        try sw.interface.flush();
     }
 };
 
-/// Parse an address string like "192.168.1.1:6881" into a net.Address.
-pub fn parseAddress(addr_str: []const u8) !std.net.Address {
-    // Find the last colon to split host:port
-    const colon_idx = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse return error.InvalidAddress;
-    const host = addr_str[0..colon_idx];
-    const port_str = addr_str[colon_idx + 1 ..];
-    const port = std.fmt.parseUnsigned(u16, port_str, 10) catch return error.InvalidPort;
-
-    return std.net.Address.parseIp4(host, port) catch {
-        return std.net.Address.parseIp6(host, port) catch return error.InvalidAddress;
-    };
+/// Parse an address string like "192.168.1.1:6881" into an IpAddress.
+pub fn parseAddress(addr_str: []const u8) !net.IpAddress {
+    return net.IpAddress.parseLiteral(addr_str) catch return error.InvalidAddress;
 }

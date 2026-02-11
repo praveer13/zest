@@ -1,8 +1,14 @@
 .{
     .name = .zest,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .fingerprint = 0x38a0093f4b358590,
-    .dependencies = .{},
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .xet = .{
+            .url = "https://github.com/jedisct1/zig-xet/archive/refs/heads/main.tar.gz",
+            .hash = "xet-0.1.0-d6TQaooXAwAQHBVsrWAQPNFzJO-xiCla5Ca6a_ibqLvc",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

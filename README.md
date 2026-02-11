@@ -2,12 +2,12 @@
 
 **P2P acceleration for ML model distribution.**
 
-[![Zig](https://img.shields.io/badge/Zig-0.14.1-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
-[![Tests](https://img.shields.io/badge/tests-16%20passing-brightgreen)](#testing)
+[![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
+[![Tests](https://img.shields.io/badge/tests-8%20passing-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
-[![Lines of Code](https://img.shields.io/badge/lines-2%2C007-informational)](#project-structure)
+[![Lines of Code](https://img.shields.io/badge/lines-1%2C234-informational)](#project-structure)
 
-zest speaks HuggingFace's [Xet protocol](https://huggingface.co/docs/xet/index) for content addressing and adds a peer swarm so model downloads come from nearby nodes instead of (only) HF's CDN.
+zest speaks HuggingFace's [Xet protocol](https://huggingface.co/docs/xet/index) (via [zig-xet](https://github.com/jedisct1/zig-xet)) for content addressing and adds a peer swarm so model downloads come from nearby nodes instead of (only) HF's CDN.
 
 ```bash
 zest pull meta-llama/Llama-3.1-70B
@@ -29,22 +29,13 @@ When a popular model drops, tens of thousands of people download the same immuta
 
 ### From source
 
-Requires [Zig 0.14.1](https://ziglang.org/download/).
+Requires [Zig 0.16.0+](https://ziglang.org/download/).
 
 ```bash
 git clone https://github.com/praveer13/zest.git
 cd zest
 zig build -Doptimize=ReleaseFast
 # binary at ./zig-out/bin/zest
-```
-
-### Quick install (pip)
-
-```bash
-pip install ziglang==0.14.1
-git clone https://github.com/praveer13/zest.git && cd zest
-zig build -Doptimize=ReleaseFast
-sudo cp zig-out/bin/zest /usr/local/bin/
 ```
 
 ## Usage
@@ -82,11 +73,10 @@ zest help       # show usage
 ┌──────────────────────────────────────────────────────────┐
 │  zest pull org/model                                     │
 ├──────────────────────────────────────────────────────────┤
-│  1. HF Hub API → authenticate, get file list             │
-│  2. Resolve endpoint → detect Xet files (X-Xet-Hash)    │
-│  3. CAS API → get reconstruction terms + presigned URLs  │
+│  1. zig-xet: list files, detect Xet-backed files         │
+│  2. zig-xet: download via Xet protocol (auth, CAS, CDN) │
 ├──────────────────────────────────────────────────────────┤
-│  For each xorb needed:                                   │
+│  For each xorb needed (P2P layer):                       │
 │    ✓ Check local cache (~/.cache/zest/xorbs/)            │
 │    ✓ Query tracker for peers                             │
 │    ✓ Download from peer (P2P) if available               │
@@ -101,7 +91,7 @@ zest help       # show usage
 
 ### Key Design Decisions
 
-- **Reuses Xet's content addressing** — same chunking, same hashing, same xorb format. A xorb from a peer is verified the same way as one from CDN.
+- **Uses [zig-xet](https://github.com/jedisct1/zig-xet) for Xet protocol** — production-quality implementation by Frank Denis (creator of libsodium). Handles auth, CAS, chunking, hashing, compression, and reconstruction.
 - **Never slower than vanilla hf_xet** — worst case is CDN-only (same as status quo).
 - **No trust required for peers** — BLAKE3 Merkle hash verification on every xorb.
 - **HF cache compatible** — writes to `~/.cache/huggingface/hub/` so all existing tooling works.
@@ -110,22 +100,16 @@ zest help       # show usage
 
 ```
 zest/
-├── build.zig              Build configuration
-├── build.zig.zon          Package manifest
+├── build.zig              Build configuration (Zig 0.16-dev)
+├── build.zig.zon          Package manifest (depends on zig-xet)
 ├── CLAUDE.md              AI assistant context
 ├── README.md              This file
 └── src/
     ├── main.zig           CLI entry point (pull, seed, version, help)
-    ├── root.zig           Library root, re-exports all modules
+    ├── root.zig           Library root, re-exports xet + zest modules
     ├── config.zig         Cache dirs, HF token discovery, path builders
-    ├── hash.zig           BLAKE3 Merkle hash (Xet-compatible keys)
-    ├── xorb.zig           Xorb types, hash verification, disk cache
-    ├── hub.zig            HF Hub API client (auth, file list, Xet detection)
-    ├── cas.zig            Xet CAS client (reconstruction terms, URLs)
-    ├── cdn.zig            HTTP range-request downloader (CDN fallback)
-    ├── reconstruct.zig    File assembly from xorbs + CAS terms
-    ├── protocol.zig       P2P wire protocol (comptime ser/de)
-    ├── peer.zig           TCP peer connections and xorb transfer
+    ├── protocol.zig       P2P wire protocol (binary ser/de)
+    ├── peer.zig           TCP peer connections via std.Io.net
     ├── tracker.zig        HTTP tracker client (peer discovery)
     ├── swarm.zig          Download orchestrator (cache→peers→CDN)
     └── storage.zig        File I/O, HF cache refs, xorb listing
@@ -135,44 +119,34 @@ zest/
 
 | Module | Lines | Tests | Purpose |
 |--------|------:|------:|---------|
-| `main.zig` | 306 | 1 | CLI entry, command routing |
-| `hub.zig` | 215 | — | HF Hub API, Xet detection |
-| `cas.zig` | 198 | — | CAS reconstruction queries |
-| `hash.zig` | 150 | 7 | BLAKE3 Merkle (Xet-compat) |
-| `protocol.zig` | 144 | 3 | P2P wire protocol |
-| `xorb.zig` | 138 | 2 | Xorb types & cache |
-| `tracker.zig` | 137 | — | Tracker client |
-| `swarm.zig` | 133 | — | Download orchestrator |
-| `config.zig` | 125 | 3 | Configuration |
-| `peer.zig` | 115 | — | P2P connections |
-| `storage.zig` | 112 | — | File I/O |
-| `reconstruct.zig` | 112 | — | File reconstruction |
-| `cdn.zig` | 99 | — | CDN downloader |
-| `root.zig` | 23 | — | Library re-exports |
-| **Total** | **2,007** | **16** | |
+| `main.zig` | 334 | 1 | CLI entry, command routing, zig-xet integration |
+| `swarm.zig` | 236 | — | Download orchestrator, xorb cache, CDN fallback |
+| `protocol.zig` | 141 | 3 | P2P wire protocol (binary ser/de) |
+| `config.zig` | 130 | 3 | Configuration, HF token, cache paths |
+| `tracker.zig` | 129 | — | HTTP tracker client |
+| `peer.zig` | 122 | — | TCP peer connections via std.Io.net |
+| `storage.zig` | 118 | — | File I/O, HF cache refs |
+| `root.zig` | 24 | 1 | Library re-exports |
+| **Total** | **1,234** | **8** | |
 
 ## Testing
 
 ```bash
 # run all tests
-zig build test
-
-# run with summary
 zig build test --summary all
 
-# run tests for a specific module
-zig test src/hash.zig
+# check formatting
+zig fmt --check src/
 ```
 
 ### Test Coverage
 
 | Module | Tests | What's Covered |
 |--------|------:|----------------|
-| `hash.zig` | 7 | BLAKE3 keyed hashing, determinism, Merkle root, hex roundtrip |
 | `config.zig` | 3 | Init/deinit, model snapshot paths, xorb cache paths |
 | `protocol.zig` | 3 | Struct ser/de, message framing roundtrip |
-| `xorb.zig` | 2 | Term struct, hash verification |
 | `main.zig` | 1 | Compile smoke test |
+| `root.zig` | 1 | Module re-export validation |
 
 ## Development
 
@@ -187,7 +161,7 @@ zig build -Doptimize=ReleaseFast
 zig build run -- pull meta-llama/Llama-3.1-8B
 
 # run tests
-zig build test
+zig build test --summary all
 ```
 
 ### Authentication
@@ -207,7 +181,7 @@ zest reads your HuggingFace token from (in order):
 
 ## Roadmap
 
-- [x] **Phase 1: CLI drop-in** — `zest pull` with CDN download, HF cache compat
+- [x] **Phase 1: CLI drop-in** — `zest pull` with zig-xet integration, HF cache compat
 - [ ] **Phase 1.5: P2P basics** — tracker server, peer xorb exchange, LAN benchmarks
 - [ ] **Phase 2: Background seeder** — `zest daemon`, auto-index, systemd service
 - [ ] **Phase 3: Python bridge** — `pip install zest`, monkey-patch `snapshot_download`
@@ -215,13 +189,14 @@ zest reads your HuggingFace token from (in order):
 
 ## Xet Protocol Compatibility
 
-zest implements the client side of HuggingFace's Xet protocol:
+zest uses [zig-xet](https://github.com/jedisct1/zig-xet) by Frank Denis for full Xet protocol support:
 
 - **Content-Defined Chunking**: Gear hash CDC with same parameters as [xet-core](https://github.com/huggingface/xet-core)
-- **BLAKE3 Merkle Hashing**: Domain-separated with `DATA_KEY` (leaf) and `INTERNAL_NODE_KEY` (tree) — byte-identical to xet-core
-- **Xorb Format**: `XETBLOB` magic, chunk headers (version + compression + lengths), footer with hash/boundary sections
-- **Compression**: None, LZ4, ByteGrouping4LZ4
-- **CAS API**: Reconstruction term queries with presigned URL extraction
+- **BLAKE3 Merkle Hashing**: Domain-separated with branching factor 4
+- **Xorb Format**: `XETBLOB` magic, chunk headers, footer parsing
+- **Compression**: None, LZ4, ByteGrouping4LZ4, FullBitsliceLZ4
+- **CAS API**: Token exchange, reconstruction term queries, parallel download
+- **Model Download**: High-level API for listing files, detecting Xet, downloading
 
 ## License
 

@@ -6,8 +6,7 @@
 ///
 /// This is a temporary solution for the MVP; full Kademlia DHT comes later.
 const std = @import("std");
-const hash_mod = @import("hash.zig");
-const protocol = @import("protocol.zig");
+const Io = std.Io;
 
 pub const TrackerPeer = struct {
     addr: []const u8, // "ip:port"
@@ -19,11 +18,11 @@ pub const TrackerClient = struct {
     tracker_url: []const u8,
     http_client: std.http.Client,
 
-    pub fn init(allocator: std.mem.Allocator, tracker_url: []const u8) !TrackerClient {
+    pub fn init(allocator: std.mem.Allocator, io: Io, tracker_url: []const u8) !TrackerClient {
         return .{
             .allocator = allocator,
             .tracker_url = try allocator.dupe(u8, tracker_url),
-            .http_client = std.http.Client{ .allocator = allocator },
+            .http_client = .{ .allocator = allocator, .io = io },
         };
     }
 
@@ -50,38 +49,32 @@ pub const TrackerClient = struct {
     /// Announce to the tracker that this peer has certain xorbs.
     pub fn announce(self: *TrackerClient, listen_addr: []const u8, xorb_hashes: []const [64]u8) !void {
         // Build JSON body: {"addr": "ip:port", "xorbs": ["hash1", "hash2", ...]}
-        var body = std.ArrayList(u8).init(self.allocator);
-        defer body.deinit();
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.allocator);
 
-        try body.appendSlice("{\"addr\":\"");
-        try body.appendSlice(listen_addr);
-        try body.appendSlice("\",\"xorbs\":[");
+        try body.appendSlice(self.allocator, "{\"addr\":\"");
+        try body.appendSlice(self.allocator, listen_addr);
+        try body.appendSlice(self.allocator, "\",\"xorbs\":[");
 
         for (xorb_hashes, 0..) |hash_hex, i| {
-            if (i > 0) try body.append(',');
-            try body.append('"');
-            try body.appendSlice(&hash_hex);
-            try body.append('"');
+            if (i > 0) try body.append(self.allocator, ',');
+            try body.append(self.allocator, '"');
+            try body.appendSlice(self.allocator, &hash_hex);
+            try body.append(self.allocator, '"');
         }
-        try body.appendSlice("]}");
+        try body.appendSlice(self.allocator, "]}");
 
         const url = try std.fmt.allocPrint(self.allocator, "{s}/announce", .{self.tracker_url});
         defer self.allocator.free(url);
 
-        const uri = try std.Uri.parse(url);
-        var header_buf: [8 * 1024]u8 = undefined;
-        var req = try self.http_client.open(.POST, uri, .{
-            .server_header_buffer = &header_buf,
+        _ = self.http_client.fetch(.{
+            .location = .{ .url = url },
+            .method = .POST,
+            .payload = body.items,
             .extra_headers = &[_]std.http.Header{
                 .{ .name = "Content-Type", .value = "application/json" },
             },
-        });
-        defer req.deinit();
-        req.transfer_encoding = .{ .content_length = body.items.len };
-        try req.send();
-        try req.writer().writeAll(body.items);
-        try req.finish();
-        try req.wait();
+        }) catch return error.HttpError;
     }
 
     fn parsePeerList(self: *TrackerClient, body: []const u8) ![]TrackerPeer {
@@ -92,10 +85,10 @@ pub const TrackerClient = struct {
 
         if (parsed.value != .array) return &[_]TrackerPeer{};
 
-        var peers = std.ArrayList(TrackerPeer).init(self.allocator);
+        var peers: std.ArrayList(TrackerPeer) = .empty;
         errdefer {
             for (peers.items) |p| self.allocator.free(p.addr);
-            peers.deinit();
+            peers.deinit(self.allocator);
         }
 
         for (parsed.value.array.items) |item| {
@@ -108,30 +101,29 @@ pub const TrackerClient = struct {
                 if (ls == .integer) last_seen = ls.integer;
             }
 
-            try peers.append(.{
+            try peers.append(self.allocator, .{
                 .addr = try self.allocator.dupe(u8, addr_val.string),
                 .last_seen = last_seen,
             });
         }
 
-        return try peers.toOwnedSlice();
+        return try peers.toOwnedSlice(self.allocator);
     }
 
     fn httpGet(self: *TrackerClient, url: []const u8) ![]u8 {
-        const uri = try std.Uri.parse(url);
-        var header_buf: [8 * 1024]u8 = undefined;
-        var req = try self.http_client.open(.GET, uri, .{
-            .server_header_buffer = &header_buf,
-        });
-        defer req.deinit();
-        try req.send();
-        try req.wait();
+        var aw: Io.Writer.Allocating = .init(self.allocator);
+        errdefer aw.deinit();
 
-        if (req.response.status != .ok) return error.HttpError;
+        const result = self.http_client.fetch(.{
+            .location = .{ .url = url },
+            .response_writer = &aw.writer,
+        }) catch return error.HttpError;
 
-        var body = std.ArrayList(u8).init(self.allocator);
-        errdefer body.deinit();
-        try req.reader().readAllArrayList(&body, 1024 * 1024);
-        return try body.toOwnedSlice();
+        if (result.status != .ok) {
+            aw.deinit();
+            return error.HttpError;
+        }
+
+        return try aw.toOwnedSlice();
     }
 };
