@@ -21,6 +21,9 @@ dependencies = [
     "requests>=2.28",
 ]
 
+[project.scripts]
+zest = "zest.cli:main"
+
 [project.optional-dependencies]
 hf = ["huggingface_hub>=0.20"]
 

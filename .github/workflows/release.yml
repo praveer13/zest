@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-wheels:
+    name: Build wheel (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux
+            zig_target: x86_64-linux-gnu
+            platform_tag: manylinux_2_17_x86_64.manylinux2014_x86_64
+          - target: aarch64-linux
+            zig_target: aarch64-linux-gnu
+            platform_tag: manylinux_2_17_aarch64.manylinux2014_aarch64
+          - target: x86_64-macos
+            zig_target: x86_64-macos-none
+            platform_tag: macosx_11_0_x86_64
+          - target: aarch64-macos
+            zig_target: aarch64-macos-none
+            platform_tag: macosx_11_0_arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python build tools
+        run: pip install build wheel
+
+      - name: Build Zig binary
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.zig_target }}
+
+      - name: Check binary
+        run: |
+          ls -lh zig-out/bin/zest
+          file zig-out/bin/zest
+
+      - name: Bundle binary into wheel
+        run: |
+          mkdir -p python/zest/_bin
+          cp zig-out/bin/zest python/zest/_bin/zest
+          chmod +x python/zest/_bin/zest
+
+      - name: Build wheel
+        working-directory: python
+        run: python -m build --wheel
+
+      - name: Retag wheel with platform
+        working-directory: python
+        run: |
+          python -m wheel tags \
+            --platform-tag="${{ matrix.platform_tag }}" \
+            --remove \
+            dist/zest_transfer-*-py3-none-any.whl
+
+      - name: List wheels
+        run: ls -lh python/dist/*.whl
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: python/dist/*.whl
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # for trusted publishing
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist/
+
+      - name: List wheels
+        run: ls -lh dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  github-release:
+    name: GitHub Release
+    needs: build-wheels
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          generate_release_notes: true
