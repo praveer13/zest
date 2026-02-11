@@ -35,6 +35,21 @@ uv pip install zest-transfer
 
 This installs the `zest` CLI and the Python library. No Zig toolchain needed.
 
+### Authentication
+
+zest needs a HuggingFace token to download models. Set it up once:
+
+```bash
+# option 1: environment variable
+export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxx
+
+# option 2: huggingface-cli (token saved to ~/.cache/huggingface/token)
+pip install huggingface_hub
+huggingface-cli login
+```
+
+Get your token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
+
 ### Python API
 
 ```python
@@ -321,12 +336,6 @@ zig build run -- pull meta-llama/Llama-3.1-8B
 # run tests
 zig build test --summary all
 ```
-
-### Authentication
-
-zest reads your HuggingFace token from (in order):
-1. `$HF_TOKEN` environment variable
-2. `~/.cache/huggingface/token` (written by `huggingface-cli login`)
 
 ### Cache Layout
 
