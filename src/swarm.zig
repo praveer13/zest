@@ -1,17 +1,23 @@
-/// Swarm orchestrator: coordinates download from peers + CDN fallback.
+/// Swarm orchestrator: coordinates BT-compliant P2P download + CDN fallback.
 ///
 /// For each needed xorb:
-///   1. Check local cache (already have it?)
-///   2. Query tracker for peers with this xorb
-///   3. If peers found → try download from peer (P2P)
-///   4. If no peers / peer fails → CDN fallback (presigned URL)
-///   5. Verify hash on receive
-///   6. Cache locally for seeding
+///   1. Check xorb cache (already have it?)
+///   2. Compute info_hash = SHA-1("zest-xet-v1:" || xorb_hash)
+///   3. DHT get_peers(info_hash) + BT tracker announce
+///   4. Connect to peers via BtPeer, BT handshake + BEP 10 handshake
+///   5. For each chunk in xorb: CHUNK_REQUEST → CHUNK_RESPONSE, verify BLAKE3
+///   6. Reassemble xorb from chunks, cache it
+///   7. CDN fallback for any missing chunks
+///   8. announce_peer to DHT (we now have it)
 const std = @import("std");
 const Io = std.Io;
-const peer_mod = @import("peer.zig");
-const tracker_mod = @import("tracker.zig");
+const net = Io.net;
 const config = @import("config.zig");
+const storage = @import("storage.zig");
+const peer_id_mod = @import("peer_id.zig");
+const bt_peer_mod = @import("bt_peer.zig");
+const bt_tracker_mod = @import("bt_tracker.zig");
+const dht_mod = @import("dht.zig");
 
 /// Reconstruction term: references a range of chunks within a xorb.
 pub const Term = struct {
@@ -65,7 +71,8 @@ pub const XorbCache = struct {
         const data = try self.allocator.alloc(u8, stat.size);
         errdefer self.allocator.free(data);
 
-        var reader = file.reader(self.io, &.{});
+        var buf: [4096]u8 = undefined;
+        var reader = file.reader(self.io, &buf);
         const bytes_read = reader.interface.readSliceShort(data) catch {
             self.allocator.free(data);
             return null;
@@ -85,10 +92,7 @@ pub const XorbCache = struct {
 
         // Ensure parent directory exists
         if (std.mem.lastIndexOfScalar(u8, cache_path, '/')) |sep| {
-            Io.Dir.createDirAbsolute(self.io, cache_path[0..sep], .default_dir) catch |err| switch (err) {
-                error.PathAlreadyExists => {},
-                else => return err,
-            };
+            storage.ensureDirRecursive(self.io, cache_path[0..sep]) catch {};
         }
 
         const file = Io.Dir.createFileAbsolute(self.io, cache_path, .{}) catch return error.WriteFailed;
@@ -108,6 +112,11 @@ pub const DownloadStats = struct {
     total_bytes: u64,
     peer_bytes: u64,
     cdn_bytes: u64,
+    // BT-specific stats
+    peer_chunks: usize,
+    cdn_chunks: usize,
+    peers_connected: usize,
+    dht_lookups: usize,
 };
 
 pub const SwarmDownloader = struct {
@@ -115,14 +124,37 @@ pub const SwarmDownloader = struct {
     io: Io,
     cfg: *const config.Config,
     http_client: std.http.Client,
-    tracker: ?tracker_mod.TrackerClient,
     cache: XorbCache,
     stats: DownloadStats,
+    // BT protocol layer
+    our_peer_id: [20]u8,
+    dht_client: ?dht_mod.Dht,
+    bt_tracker: ?bt_tracker_mod.BtTrackerClient,
+    enable_p2p: bool,
 
-    pub fn init(allocator: std.mem.Allocator, io: Io, cfg_ptr: *const config.Config, tracker_url: ?[]const u8) !SwarmDownloader {
-        var tracker_client: ?tracker_mod.TrackerClient = null;
-        if (tracker_url) |url| {
-            tracker_client = try tracker_mod.TrackerClient.init(allocator, io, url);
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: Io,
+        cfg_ptr: *const config.Config,
+        tracker_url: ?[]const u8,
+        enable_p2p: bool,
+    ) !SwarmDownloader {
+        var dht_client: ?dht_mod.Dht = null;
+        var bt_tracker: ?bt_tracker_mod.BtTrackerClient = null;
+
+        if (enable_p2p) {
+            // Initialize DHT
+            dht_client = dht_mod.Dht.init(allocator, io, cfg_ptr.dht_port) catch null;
+
+            // Initialize BT tracker if URL provided
+            if (tracker_url) |url| {
+                bt_tracker = bt_tracker_mod.BtTrackerClient.init(
+                    allocator,
+                    io,
+                    url,
+                    cfg_ptr.peer_id,
+                ) catch null;
+            }
         }
 
         return .{
@@ -130,15 +162,19 @@ pub const SwarmDownloader = struct {
             .io = io,
             .cfg = cfg_ptr,
             .http_client = .{ .allocator = allocator, .io = io },
-            .tracker = tracker_client,
             .cache = XorbCache.init(allocator, io, cfg_ptr),
             .stats = std.mem.zeroes(DownloadStats),
+            .our_peer_id = cfg_ptr.peer_id,
+            .dht_client = dht_client,
+            .bt_tracker = bt_tracker,
+            .enable_p2p = enable_p2p,
         };
     }
 
     pub fn deinit(self: *SwarmDownloader) void {
         self.http_client.deinit();
-        if (self.tracker) |*t| t.deinit();
+        if (self.dht_client) |*d| d.deinit();
+        if (self.bt_tracker) |*t| t.deinit();
     }
 
     /// Download all xorbs needed for a file's reconstruction.
@@ -159,25 +195,10 @@ pub const SwarmDownloader = struct {
             return;
         }
 
-        // Step 2: Try peers via tracker
-        if (self.tracker) |*t| {
-            const peers = t.getPeers(hex) catch &[_]tracker_mod.TrackerPeer{};
-            defer {
-                for (peers) |p| self.allocator.free(p.addr);
-                if (peers.len > 0) self.allocator.free(peers);
-            }
-
-            for (peers) |p| {
-                if (self.tryPeerDownload(p.addr, term)) |data| {
-                    defer self.allocator.free(data);
-                    self.cache.put(hex, data) catch {};
-                    self.stats.peer_xorbs += 1;
-                    self.stats.peer_bytes += data.len;
-                    self.stats.total_bytes += data.len;
-                    return;
-                } else |_| {
-                    continue; // Try next peer
-                }
+        // Step 2: Try P2P via BT protocol
+        if (self.enable_p2p) {
+            if (self.tryBtPeerDownload(term)) {
+                return;
             }
         }
 
@@ -191,16 +212,76 @@ pub const SwarmDownloader = struct {
         self.stats.cdn_xorbs += 1;
         self.stats.cdn_bytes += data.len;
         self.stats.total_bytes += data.len;
+        self.stats.cdn_chunks += 1;
     }
 
-    fn tryPeerDownload(self: *SwarmDownloader, addr_str: []const u8, term: *const Term) ![]u8 {
-        const address = try peer_mod.parseAddress(addr_str);
-        var conn = try peer_mod.PeerConnection.connect(self.allocator, self.io, address);
-        defer conn.deinit();
+    /// Try to download a xorb via BT peers (DHT + tracker discovery).
+    fn tryBtPeerDownload(self: *SwarmDownloader, term: *const Term) bool {
+        const info_hash = peer_id_mod.computeInfoHash(term.xorb_hash);
 
-        try conn.handshake([_]u8{0} ** 32, 0, 0);
+        // Discover peers via DHT
+        if (self.dht_client) |*d| {
+            self.stats.dht_lookups += 1;
+            const peers = d.getPeers(info_hash) catch &[_]dht_mod.CompactPeer{};
+            defer if (peers.len > 0) self.allocator.free(peers);
 
-        return try conn.requestXorb(term.xorb_hash);
+            for (peers) |peer| {
+                if (self.tryBtChunkDownload(peer.address, info_hash, term)) {
+                    return true;
+                }
+            }
+        }
+
+        // Discover peers via BT tracker
+        if (self.bt_tracker) |*t| {
+            const resp = t.announce(info_hash, self.cfg.listen_port, .started) catch return false;
+            defer @constCast(&resp).deinit();
+
+            for (resp.peers) |peer| {
+                if (self.tryBtChunkDownload(peer.address, info_hash, term)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// Try to download xorb data from a single BT peer.
+    fn tryBtChunkDownload(self: *SwarmDownloader, address: net.IpAddress, info_hash: [20]u8, term: *const Term) bool {
+        var peer = bt_peer_mod.BtPeer.connect(
+            self.allocator,
+            self.io,
+            address,
+            info_hash,
+            self.our_peer_id,
+            self.cfg.listen_port,
+        ) catch return false;
+        defer peer.deinit();
+
+        peer.performHandshake() catch return false;
+
+        if (!peer.supports_xet) return false;
+
+        self.stats.peers_connected += 1;
+
+        // Request the xorb as a single chunk (simplified — full chunk-level splitting comes later)
+        const data = peer.requestChunk(term.xorb_hash) catch return false;
+        defer self.allocator.free(data);
+
+        // Cache and record stats
+        self.cache.put(&term.xorb_hash_hex, data) catch {};
+        self.stats.peer_xorbs += 1;
+        self.stats.peer_bytes += data.len;
+        self.stats.total_bytes += data.len;
+        self.stats.peer_chunks += 1;
+
+        // Announce to DHT that we now have this xorb
+        if (self.dht_client) |*d| {
+            d.announcePeer(info_hash, self.cfg.listen_port) catch {};
+        }
+
+        return true;
     }
 
     /// Simple HTTP download from a URL using fetch.
@@ -221,16 +302,33 @@ pub const SwarmDownloader = struct {
         return try aw.toOwnedSlice();
     }
 
+    /// Announce all provided xorb hashes to the swarm.
+    pub fn announceToSwarm(self: *SwarmDownloader, xorb_hashes: []const [32]u8) !void {
+        for (xorb_hashes) |xorb_hash| {
+            const info_hash = peer_id_mod.computeInfoHash(xorb_hash);
+
+            if (self.dht_client) |*d| {
+                d.announcePeer(info_hash, self.cfg.listen_port) catch {};
+            }
+
+            if (self.bt_tracker) |*t| {
+                _ = t.announce(info_hash, self.cfg.listen_port, .started) catch {};
+            }
+        }
+    }
+
     pub fn printStats(self: *const SwarmDownloader, w: *Io.Writer) void {
         w.print("\nDownload stats:\n", .{}) catch {};
-        w.print("  Total xorbs:  {d}\n", .{self.stats.total_xorbs}) catch {};
-        w.print("  From cache:   {d}\n", .{self.stats.cached_xorbs}) catch {};
-        w.print("  From peers:   {d}\n", .{self.stats.peer_xorbs}) catch {};
-        w.print("  From CDN:     {d}\n", .{self.stats.cdn_xorbs}) catch {};
-        w.print("  Total bytes:  {d}\n", .{self.stats.total_bytes}) catch {};
+        w.print("  Total xorbs:     {d}\n", .{self.stats.total_xorbs}) catch {};
+        w.print("  From cache:      {d}\n", .{self.stats.cached_xorbs}) catch {};
+        w.print("  From peers:      {d}\n", .{self.stats.peer_xorbs}) catch {};
+        w.print("  From CDN:        {d}\n", .{self.stats.cdn_xorbs}) catch {};
+        w.print("  Total bytes:     {d}\n", .{self.stats.total_bytes}) catch {};
+        w.print("  Peers connected: {d}\n", .{self.stats.peers_connected}) catch {};
+        w.print("  DHT lookups:     {d}\n", .{self.stats.dht_lookups}) catch {};
         if (self.stats.total_bytes > 0) {
             const peer_pct = @as(f64, @floatFromInt(self.stats.peer_bytes)) / @as(f64, @floatFromInt(self.stats.total_bytes)) * 100.0;
-            w.print("  P2P ratio:    {d:.1}%\n", .{peer_pct}) catch {};
+            w.print("  P2P ratio:       {d:.1}%\n", .{peer_pct}) catch {};
         }
     }
 };

@@ -1,10 +1,19 @@
 const std = @import("std");
 const Io = std.Io;
 const Environ = std.process.Environ;
+const peer_id_mod = @import("peer_id.zig");
 
 pub const hf_hub_url = "https://huggingface.co";
 pub const default_revision = "main";
-pub const default_tracker_port: u16 = 6881;
+pub const default_dht_port: u16 = 6881;
+pub const default_listen_port: u16 = 6881;
+pub const default_chunk_target_size: u32 = 65536; // 64KB — matches HF Xet CDC chunk size
+
+/// Well-known BT DHT bootstrap nodes.
+pub const dht_bootstrap_nodes = [_]struct { host: []const u8, port: u16 }{
+    .{ .host = "router.bittorrent.com", .port = 6881 },
+    .{ .host = "dht.transmissionbt.com", .port = 6881 },
+};
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
@@ -13,6 +22,11 @@ pub const Config = struct {
     cache_dir: []const u8,
     hf_cache_dir: []const u8,
     xorb_cache_dir: []const u8,
+    chunk_cache_dir: []const u8,
+    peer_id: [20]u8,
+    dht_port: u16,
+    listen_port: u16,
+    chunk_target_size: u32,
 
     pub fn init(allocator: std.mem.Allocator, io: Io, environ: Environ) !Config {
         const home = environ.getPosix("HOME") orelse "/root";
@@ -29,6 +43,7 @@ pub const Config = struct {
             try std.fmt.allocPrint(allocator, "{s}/.cache/zest", .{home});
 
         const xorb_cache_dir = try std.fmt.allocPrint(allocator, "{s}/xorbs", .{cache_dir});
+        const chunk_cache_dir = try std.fmt.allocPrint(allocator, "{s}/chunks", .{cache_dir});
 
         const hf_token = try readHfToken(allocator, io, environ, home);
 
@@ -39,12 +54,18 @@ pub const Config = struct {
             .cache_dir = cache_dir,
             .hf_cache_dir = hf_cache_dir,
             .xorb_cache_dir = xorb_cache_dir,
+            .chunk_cache_dir = chunk_cache_dir,
+            .peer_id = peer_id_mod.generate(io),
+            .dht_port = default_dht_port,
+            .listen_port = default_listen_port,
+            .chunk_target_size = default_chunk_target_size,
         };
     }
 
     pub fn deinit(self: *Config) void {
         if (self.hf_token) |token| self.allocator.free(token);
         self.allocator.free(self.xorb_cache_dir);
+        self.allocator.free(self.chunk_cache_dir);
         self.allocator.free(self.cache_dir);
         self.allocator.free(self.hf_cache_dir);
     }
@@ -76,6 +97,16 @@ pub const Config = struct {
             self.allocator,
             "{s}/{s}/{s}",
             .{ self.xorb_cache_dir, hash_hex[0..2], hash_hex },
+        );
+    }
+
+    /// Build the chunk cache path: ~/.cache/zest/chunks/{prefix}/{hash}
+    pub fn chunkCachePath(self: *const Config, hash_hex: []const u8) ![]u8 {
+        if (hash_hex.len < 4) return error.InvalidHash;
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}/{s}",
+            .{ self.chunk_cache_dir, hash_hex[0..2], hash_hex },
         );
     }
 };

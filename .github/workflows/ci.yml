@@ -62,6 +62,43 @@ jobs:
       - name: Check formatting
         run: zig fmt --check src/
 
+  benchmark:
+    name: Benchmark
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Build ReleaseFast
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Run synthetic benchmarks
+        run: ./zig-out/bin/zest bench --synthetic --json > bench_results.json
+
+      - name: Publish results
+        run: |
+          echo "## Benchmark Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          python3 -c "
+          import json, sys
+          d = json.load(open('bench_results.json'))
+          print('| Metric | Runs | Median (ns) | Throughput (MB/s) |')
+          print('|--------|------|-------------|-------------------|')
+          for r in d['results']:
+              print(f'| {r[\"name\"]} | {r[\"runs\"]} | {r[\"median_ns\"]} | {r[\"throughput_mbps\"]:.1f} |')
+          " >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench_results.json
+
   metrics:
     name: Metrics
     runs-on: ubuntu-latest

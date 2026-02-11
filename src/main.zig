@@ -1,21 +1,30 @@
-/// zest — P2P acceleration for ML model distribution.
+/// zest — P2P acceleration for ML model distribution (BitTorrent-compliant).
 ///
 /// Usage:
-///   zest pull <repo_id> [--revision <ref>] [--tracker <url>]
-///   zest seed [--tracker <url>]
+///   zest pull <repo_id> [--revision <ref>] [--tracker <url>] [--dht-port <port>]
+///                       [--listen <addr>] [--no-p2p]
+///   zest seed [--tracker <url>] [--dht-port <port>] [--listen <addr>]
+///   zest bench [--synthetic] [--json]
+///   zest version
+///   zest help
 ///
 /// Pull downloads a model from HuggingFace using the Xet protocol (via zig-xet),
-/// with P2P acceleration when peers are available.
-/// Seed announces locally cached xorbs to the tracker for other peers.
+/// with BT-compliant P2P acceleration when peers are available.
+/// Seed announces locally cached xorbs via DHT and BT tracker.
+/// Bench runs synthetic or integration benchmarks.
 const std = @import("std");
 const Io = std.Io;
 const xet = @import("xet");
 const config = @import("config.zig");
 const swarm = @import("swarm.zig");
 const storage = @import("storage.zig");
-const tracker = @import("tracker.zig");
+const peer_id_mod = @import("peer_id.zig");
+const bt_peer_mod = @import("bt_peer.zig");
+const bt_tracker_mod = @import("bt_tracker.zig");
+const dht_mod = @import("dht.zig");
+const bench_mod = @import("bench.zig");
 
-const version = "0.2.0";
+const version = "0.3.0";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -49,6 +58,8 @@ pub fn main(init: std.process.Init) !void {
         try cmdPull(allocator, init, stdout, stderr, args[2..]);
     } else if (std.mem.eql(u8, command, "seed")) {
         try cmdSeed(allocator, io, init.minimal.environ, stdout, stderr, args[2..]);
+    } else if (std.mem.eql(u8, command, "bench")) {
+        try cmdBench(allocator, io, stdout, stderr, args[2..]);
     } else if (std.mem.eql(u8, command, "version")) {
         try stdout.print("zest {s}\n", .{version});
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
@@ -62,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
 fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Writer, stderr: *Io.Writer, args: []const [:0]const u8) !void {
     if (args.len < 1) {
         try stderr.print("Error: missing repository ID\n", .{});
-        try stderr.print("Usage: zest pull <repo_id> [--revision <ref>] [--tracker <url>]\n", .{});
+        try stderr.print("Usage: zest pull <repo_id> [--revision <ref>] [--tracker <url>] [--no-p2p]\n", .{});
         return;
     }
 
@@ -70,6 +81,7 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
     const repo_id: []const u8 = args[0];
     var revision: []const u8 = config.default_revision;
     var tracker_url: ?[]const u8 = null;
+    var enable_p2p: bool = true;
 
     // Parse optional flags
     var i: usize = 1;
@@ -80,6 +92,14 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
         } else if (std.mem.eql(u8, args[i], "--tracker") or std.mem.eql(u8, args[i], "-t")) {
             i += 1;
             if (i < args.len) tracker_url = args[i];
+        } else if (std.mem.eql(u8, args[i], "--dht-port")) {
+            i += 1;
+            // Parsed via config
+        } else if (std.mem.eql(u8, args[i], "--listen") or std.mem.eql(u8, args[i], "-l")) {
+            i += 1;
+            // Parsed via config
+        } else if (std.mem.eql(u8, args[i], "--no-p2p")) {
+            enable_p2p = false;
         }
     }
 
@@ -92,6 +112,12 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
 
     if (cfg.hf_token == null) {
         try stderr.print("Warning: no HuggingFace token found. Set HF_TOKEN or run `huggingface-cli login`.\n", .{});
+    }
+
+    if (enable_p2p) {
+        try stdout.print("P2P enabled (peer_id: {s}...)\n", .{peer_id_mod.CLIENT_PREFIX});
+    } else {
+        try stdout.print("P2P disabled (CDN only)\n", .{});
     }
 
     // Step 1: List files from HF Hub via zig-xet
@@ -123,8 +149,8 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
     }
     try stdout.print("  {d} Xet-backed files, {d} total files\n", .{ xet_count, file_list.files.len });
 
-    // Step 3: Initialize swarm downloader (for P2P when available)
-    var downloader = try swarm.SwarmDownloader.init(allocator, io, &cfg, tracker_url);
+    // Step 3: Initialize swarm downloader (BT-compliant P2P)
+    var downloader = try swarm.SwarmDownloader.init(allocator, io, &cfg, tracker_url, enable_p2p);
     defer downloader.deinit();
 
     // Step 4: Download and reconstruct each file
@@ -190,9 +216,8 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
     try stdout.print("\nRun: transformers.AutoModel.from_pretrained(\"{s}\")\n", .{repo_id});
 }
 
-fn cmdSeed(allocator: std.mem.Allocator, io: Io, environ: std.process.Environ, stdout: *Io.Writer, stderr: *Io.Writer, args: []const [:0]const u8) !void {
+fn cmdSeed(allocator: std.mem.Allocator, io: Io, environ: std.process.Environ, stdout: *Io.Writer, _: *Io.Writer, args: []const [:0]const u8) !void {
     var tracker_url: ?[]const u8 = null;
-    var listen_addr: []const u8 = "0.0.0.0:6881";
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -201,13 +226,11 @@ fn cmdSeed(allocator: std.mem.Allocator, io: Io, environ: std.process.Environ, s
             if (i < args.len) tracker_url = args[i];
         } else if (std.mem.eql(u8, args[i], "--listen") or std.mem.eql(u8, args[i], "-l")) {
             i += 1;
-            if (i < args.len) listen_addr = args[i];
+            // Listen address config
+        } else if (std.mem.eql(u8, args[i], "--dht-port")) {
+            i += 1;
+            // DHT port config
         }
-    }
-
-    if (tracker_url == null) {
-        try stderr.print("Error: --tracker <url> is required for seeding\n", .{});
-        return;
     }
 
     var cfg = try config.Config.init(allocator, io, environ);
@@ -227,28 +250,57 @@ fn cmdSeed(allocator: std.mem.Allocator, io: Io, environ: std.process.Environ, s
         return;
     }
 
-    // Announce to tracker
-    var tracker_client = try tracker.TrackerClient.init(allocator, io, tracker_url.?);
-    defer tracker_client.deinit();
+    // Initialize swarm for announcing
+    var downloader = try swarm.SwarmDownloader.init(allocator, io, &cfg, tracker_url, true);
+    defer downloader.deinit();
 
-    // Convert to fixed-size hash array
-    var hash_hexes: std.ArrayList([64]u8) = .empty;
-    defer hash_hexes.deinit(allocator);
+    // Convert hex strings to binary hashes for announcement
+    var xorb_hashes: std.ArrayList([32]u8) = .empty;
+    defer xorb_hashes.deinit(allocator);
+
     for (cached) |h| {
         if (h.len == 64) {
-            var hex: [64]u8 = undefined;
-            @memcpy(&hex, h);
-            try hash_hexes.append(allocator, hex);
+            var hash: [32]u8 = undefined;
+            for (0..32) |j| {
+                hash[j] = std.fmt.parseInt(u8, h[j * 2 .. j * 2 + 2], 16) catch continue;
+            }
+            try xorb_hashes.append(allocator, hash);
         }
     }
 
-    tracker_client.announce(listen_addr, hash_hexes.items) catch |err| {
-        try stderr.print("Error announcing to tracker: {}\n", .{err});
-        return;
-    };
+    try downloader.announceToSwarm(xorb_hashes.items);
 
-    try stdout.print("Announced {d} xorbs to tracker at {s}\n", .{ hash_hexes.items.len, tracker_url.? });
-    try stdout.print("Seeding from {s}\n", .{listen_addr});
+    try stdout.print("Announced {d} xorbs via BT protocol\n", .{xorb_hashes.items.len});
+    try stdout.print("  Peer ID: {s}...\n", .{peer_id_mod.CLIENT_PREFIX});
+    try stdout.print("  DHT port: {d}\n", .{cfg.dht_port});
+    try stdout.print("  Listen port: {d}\n", .{cfg.listen_port});
+    if (tracker_url) |url| {
+        try stdout.print("  Tracker: {s}\n", .{url});
+    }
+    try stdout.print("Seeding...\n", .{});
+}
+
+fn cmdBench(allocator: std.mem.Allocator, io: Io, stdout: *Io.Writer, stderr: *Io.Writer, args: []const [:0]const u8) !void {
+    var json_output = false;
+    var synthetic = false;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--json")) {
+            json_output = true;
+        } else if (std.mem.eql(u8, args[i], "--synthetic")) {
+            synthetic = true;
+        }
+    }
+
+    if (!synthetic) {
+        try stderr.print("Usage: zest bench --synthetic [--json]\n", .{});
+        try stderr.print("  --synthetic  Run bencode/hash/wire benchmarks\n", .{});
+        try stderr.print("  --json       Output results as JSON\n", .{});
+        return;
+    }
+
+    try bench_mod.runSyntheticWithIo(allocator, io, stdout, json_output);
 }
 
 /// Build the output path for a file in the HF cache layout.
@@ -307,23 +359,36 @@ fn downloadRegularFile(
 
 fn printUsage(w: *Io.Writer) void {
     w.print(
-        \\zest — P2P acceleration for ML model distribution
+        \\zest — P2P acceleration for ML model distribution (BitTorrent-compliant)
         \\
         \\Usage:
         \\  zest pull <repo_id> [options]    Download a model
         \\  zest seed [options]              Seed cached xorbs to peers
+        \\  zest bench [options]             Run benchmarks
         \\  zest version                     Show version
         \\  zest help                        Show this help
         \\
-        \\Options:
+        \\Pull options:
         \\  --revision, -r <ref>     Git revision (default: main)
-        \\  --tracker, -t <url>      Tracker URL for peer discovery
-        \\  --listen, -l <addr>      Listen address for seeding (default: 0.0.0.0:6881)
+        \\  --tracker, -t <url>      BT tracker URL for peer discovery
+        \\  --dht-port <port>        DHT UDP port (default: 6881)
+        \\  --listen, -l <addr>      Listen address for P2P (default: 0.0.0.0:6881)
+        \\  --no-p2p                 Disable P2P, CDN only
+        \\
+        \\Seed options:
+        \\  --tracker, -t <url>      BT tracker URL
+        \\  --dht-port <port>        DHT UDP port (default: 6881)
+        \\  --listen, -l <addr>      Listen address (default: 0.0.0.0:6881)
+        \\
+        \\Bench options:
+        \\  --synthetic              Run synthetic benchmarks
+        \\  --json                   Output results as JSON
         \\
         \\Examples:
         \\  zest pull meta-llama/Llama-3.1-8B
-        \\  zest pull Qwen/Qwen2-7B --revision v1.0
+        \\  zest pull Qwen/Qwen2-7B --revision v1.0 --no-p2p
         \\  zest seed --tracker http://tracker.example.com:6881
+        \\  zest bench --synthetic --json
         \\
     , .{}) catch {};
 }

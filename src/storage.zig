@@ -85,6 +85,63 @@ pub fn writeRef(allocator: std.mem.Allocator, cfg: *const config.Config, repo_id
     try writeFileAtomic(io, ref_path, commit_sha);
 }
 
+// ── Chunk cache ──
+
+/// Convert a 32-byte hash to 64-char hex string.
+pub fn hashToHex(hash: [32]u8) [64]u8 {
+    const hex_chars = "0123456789abcdef";
+    var result: [64]u8 = undefined;
+    for (0..32) |i| {
+        result[i * 2] = hex_chars[hash[i] >> 4];
+        result[i * 2 + 1] = hex_chars[hash[i] & 0x0F];
+    }
+    return result;
+}
+
+/// Write a chunk to the local cache by its BLAKE3 hash.
+pub fn writeChunk(io: Io, cfg_ptr: *const config.Config, chunk_hash: [32]u8, data: []const u8) !void {
+    const hex = hashToHex(chunk_hash);
+    const path = try cfg_ptr.chunkCachePath(&hex);
+    defer cfg_ptr.allocator.free(path);
+    writeFileAtomic(io, path, data) catch {};
+}
+
+/// Read a chunk from the local cache. Returns null if not found.
+pub fn readChunk(allocator: std.mem.Allocator, io: Io, cfg_ptr: *const config.Config, chunk_hash: [32]u8) !?[]u8 {
+    const hex = hashToHex(chunk_hash);
+    const path = try cfg_ptr.chunkCachePath(&hex);
+    defer allocator.free(path);
+
+    const file = Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+    defer file.close(io);
+
+    const stat = file.stat(io) catch return null;
+    const data = try allocator.alloc(u8, stat.size);
+    errdefer allocator.free(data);
+
+    var buf: [4096]u8 = undefined;
+    var reader = file.reader(io, &buf);
+    const bytes_read = reader.interface.readSliceShort(data) catch {
+        allocator.free(data);
+        return null;
+    };
+    if (bytes_read != stat.size) {
+        allocator.free(data);
+        return null;
+    }
+
+    return data;
+}
+
+/// Check if a chunk exists in the local cache.
+pub fn hasChunk(io: Io, cfg_ptr: *const config.Config, chunk_hash: [32]u8) bool {
+    const hex = hashToHex(chunk_hash);
+    const path = cfg_ptr.chunkCachePath(&hex) catch return false;
+    defer cfg_ptr.allocator.free(path);
+    Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    return true;
+}
+
 /// List all xorb hashes in the local cache (for seeding).
 pub fn listCachedXorbs(allocator: std.mem.Allocator, cfg: *const config.Config) ![][]const u8 {
     const io = cfg.io;
