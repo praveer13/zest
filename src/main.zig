@@ -151,8 +151,16 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
     };
     defer file_list.deinit();
 
-    const commit = revision;
-    try stdout.print("Found {d} files (revision: {s})\n", .{ file_list.files.len, commit });
+    // Resolve revision to actual commit SHA (e.g. "main" → "607a30d7...")
+    const resolved_sha = resolveCommitSha(allocator, io, repo_id, revision, cfg.hf_token);
+    defer if (resolved_sha) |s| allocator.free(s);
+    const commit: []const u8 = resolved_sha orelse revision;
+
+    if (resolved_sha != null) {
+        try stdout.print("Found {d} files (revision: {s} → {s})\n", .{ file_list.files.len, revision, commit });
+    } else {
+        try stdout.print("Found {d} files (revision: {s})\n", .{ file_list.files.len, revision });
+    }
 
     // Step 2: Detect Xet files
     try stdout.print("Detecting Xet-backed files...\n", .{});
@@ -487,6 +495,67 @@ fn ensureParentDirs(io: Io, path: []const u8) !void {
     }
 }
 
+/// Resolve a revision (branch name like "main") to an actual commit SHA
+/// by querying the HF API: GET /api/models/{repo}/revision/{revision}
+/// Returns the SHA string, or null if resolution fails (falls back to revision as-is).
+fn resolveCommitSha(allocator: std.mem.Allocator, io: Io, repo_id: []const u8, revision: []const u8, token: ?[]const u8) ?[]u8 {
+    const url = std.fmt.allocPrint(
+        allocator,
+        "{s}/api/models/{s}/revision/{s}",
+        .{ config.hf_hub_url, repo_id, revision },
+    ) catch return null;
+    defer allocator.free(url);
+
+    var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer http_client.deinit();
+
+    var aw: Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    // Build authorization header if token available
+    var auth_buf: [256]u8 = undefined;
+    const auth_header: ?[]const u8 = if (token) |t|
+        std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{t}) catch null
+    else
+        null;
+
+    const extra_headers: []const std.http.Header = if (auth_header) |auth|
+        &.{.{ .name = "authorization", .value = auth }}
+    else
+        &.{};
+
+    const result = http_client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &aw.writer,
+        .extra_headers = extra_headers,
+    }) catch return null;
+
+    if (result.status != .ok) return null;
+
+    const body = aw.written();
+
+    // Parse JSON to extract "sha" field
+    // Response looks like: {"sha":"607a30d783dfa663caf39e06633721c8d4cfcd7e",...}
+    return extractJsonSha(allocator, body);
+}
+
+/// Extract the "sha" value from a JSON response.
+/// Looks for "sha":"<40-char hex>" pattern.
+fn extractJsonSha(allocator: std.mem.Allocator, json: []const u8) ?[]u8 {
+    // Find "sha":" pattern
+    const needle = "\"sha\":\"";
+    const pos = std.mem.indexOf(u8, json, needle) orelse return null;
+    const start = pos + needle.len;
+    if (start + 40 > json.len) return null;
+
+    const sha = json[start..][0..40];
+    // Validate it's hex
+    for (sha) |c| {
+        if (!std.ascii.isHex(c)) return null;
+    }
+    return allocator.dupe(u8, sha) catch null;
+}
+
 fn downloadRegularFile(
     allocator: std.mem.Allocator,
     io: Io,
@@ -570,4 +639,30 @@ fn printUsage(w: *Io.Writer) void {
 test "arg parsing smoke test" {
     // Just verify the module compiles and basic types are accessible
     try std.testing.expect(version.len > 0);
+}
+
+test "extractJsonSha parses HF API response" {
+    const json =
+        \\{"_id":"6340","id":"gpt2","sha":"607a30d783dfa663caf39e06633721c8d4cfcd7e","other":"value"}
+    ;
+    const sha = extractJsonSha(std.testing.allocator, json);
+    defer if (sha) |s| std.testing.allocator.free(s);
+    try std.testing.expect(sha != null);
+    try std.testing.expectEqualStrings("607a30d783dfa663caf39e06633721c8d4cfcd7e", sha.?);
+}
+
+test "extractJsonSha returns null for missing sha" {
+    const json =
+        \\{"id":"gpt2","name":"GPT-2"}
+    ;
+    const sha = extractJsonSha(std.testing.allocator, json);
+    try std.testing.expect(sha == null);
+}
+
+test "extractJsonSha rejects invalid hex" {
+    const json =
+        \\{"sha":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"}
+    ;
+    const sha = extractJsonSha(std.testing.allocator, json);
+    try std.testing.expect(sha == null);
 }
