@@ -34,7 +34,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.16.0
+          version: master
 
       - name: Set up Python
         uses: actions/setup-python@v5
