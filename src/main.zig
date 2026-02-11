@@ -23,6 +23,8 @@ const bt_peer_mod = @import("bt_peer.zig");
 const bt_tracker_mod = @import("bt_tracker.zig");
 const dht_mod = @import("dht.zig");
 const bench_mod = @import("bench.zig");
+const server_mod = @import("server.zig");
+const http_api_mod = @import("http_api.zig");
 
 const version = "0.3.0";
 
@@ -60,6 +62,12 @@ pub fn main(init: std.process.Init) !void {
         try cmdSeed(allocator, io, init.minimal.environ, stdout, stderr, args[2..]);
     } else if (std.mem.eql(u8, command, "bench")) {
         try cmdBench(allocator, io, stdout, stderr, args[2..]);
+    } else if (std.mem.eql(u8, command, "serve")) {
+        try cmdServe(allocator, init, stdout, stderr, args[2..]);
+    } else if (std.mem.eql(u8, command, "start")) {
+        try cmdStart(allocator, io, init.minimal.environ, stdout, stderr);
+    } else if (std.mem.eql(u8, command, "stop")) {
+        try cmdStop(allocator, io, init.minimal.environ, stdout, stderr);
     } else if (std.mem.eql(u8, command, "version")) {
         try stdout.print("zest {s}\n", .{version});
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
@@ -82,6 +90,8 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
     var revision: []const u8 = config.default_revision;
     var tracker_url: ?[]const u8 = null;
     var enable_p2p: bool = true;
+    var direct_peers: std.ArrayList([]const u8) = .empty;
+    defer direct_peers.deinit(allocator);
 
     // Parse optional flags
     var i: usize = 1;
@@ -92,6 +102,9 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
         } else if (std.mem.eql(u8, args[i], "--tracker") or std.mem.eql(u8, args[i], "-t")) {
             i += 1;
             if (i < args.len) tracker_url = args[i];
+        } else if (std.mem.eql(u8, args[i], "--peer") or std.mem.eql(u8, args[i], "-p")) {
+            i += 1;
+            if (i < args.len) try direct_peers.append(allocator, args[i]);
         } else if (std.mem.eql(u8, args[i], "--dht-port")) {
             i += 1;
             // Parsed via config
@@ -152,6 +165,16 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
     // Step 3: Initialize swarm downloader (BT-compliant P2P)
     var downloader = try swarm.SwarmDownloader.init(allocator, io, &cfg, tracker_url, enable_p2p);
     defer downloader.deinit();
+
+    // Add direct peers from --peer flags
+    for (direct_peers.items) |peer_str| {
+        const addr = bt_peer_mod.parseAddress(peer_str) catch {
+            try stderr.print("Warning: invalid peer address: {s}\n", .{peer_str});
+            continue;
+        };
+        downloader.addDirectPeer(addr) catch {};
+        try stdout.print("  Direct peer: {s}\n", .{peer_str});
+    }
 
     // Step 4: Download and reconstruct each file
     var files_done: usize = 0;
@@ -303,6 +326,147 @@ fn cmdBench(allocator: std.mem.Allocator, io: Io, stdout: *Io.Writer, stderr: *I
     try bench_mod.runSyntheticWithIo(allocator, io, stdout, json_output);
 }
 
+fn cmdServe(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Writer, _: *Io.Writer, args: []const [:0]const u8) !void {
+    const io = init.io;
+    const environ = init.minimal.environ;
+
+    var cfg = try config.Config.init(allocator, io, environ);
+    defer cfg.deinit();
+
+    // Parse optional flags
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--http-port")) {
+            i += 1;
+            if (i < args.len) cfg.http_port = std.fmt.parseInt(u16, args[i], 10) catch cfg.http_port;
+        } else if (std.mem.eql(u8, args[i], "--listen-port")) {
+            i += 1;
+            if (i < args.len) cfg.listen_port = std.fmt.parseInt(u16, args[i], 10) catch cfg.listen_port;
+        }
+    }
+
+    // Index cached xorbs
+    var registry = storage.XorbRegistry.init(allocator);
+    defer registry.deinit();
+    registry.scan(&cfg) catch {};
+
+    try stdout.print("zest server v{s}\n", .{version});
+    try stdout.print("  BT listen port: {d}\n", .{cfg.listen_port});
+    try stdout.print("  HTTP API port:  {d}\n", .{cfg.http_port});
+    try stdout.print("  Peer ID:        {s}...\n", .{peer_id_mod.CLIENT_PREFIX});
+    try stdout.print("  Cached xorbs:   {d}\n", .{registry.count()});
+    try stdout.print("\nServer running. Press Ctrl+C to stop.\n", .{});
+    try stdout.flush();
+
+    // Write PID file
+    writePidFile(io, cfg.pid_file_path) catch {};
+
+    // Shared shutdown flag
+    var shutdown_flag = std.atomic.Value(bool).init(false);
+
+    // Start BT server
+    var bt_server = server_mod.BtServer.init(allocator, io, &cfg);
+
+    // Start HTTP API
+    var http_api = http_api_mod.HttpApi.init(allocator, io, &cfg, &bt_server, &shutdown_flag);
+
+    // Run BT server (blocks until shutdown)
+    // In the future, run BT and HTTP concurrently with Io.Group
+    // For now, run HTTP API (which handles /v1/stop to trigger shutdown)
+    _ = &bt_server;
+    http_api.run() catch |err| {
+        try stdout.print("HTTP API error: {}\n", .{err});
+    };
+
+    // Cleanup
+    removePidFile(io, cfg.pid_file_path);
+    try stdout.print("\nServer stopped.\n", .{});
+}
+
+fn cmdStart(allocator: std.mem.Allocator, io: Io, environ: std.process.Environ, stdout: *Io.Writer, stderr: *Io.Writer) !void {
+    var cfg = try config.Config.init(allocator, io, environ);
+    defer cfg.deinit();
+
+    // Check if already running
+    if (readPidFile(allocator, io, cfg.pid_file_path)) |pid_str| {
+        defer allocator.free(pid_str);
+        try stderr.print("zest is already running (PID {s}). Use `zest stop` first.\n", .{pid_str});
+        return;
+    }
+
+    // TODO: Spawn `zest serve` as a detached child process.
+    // For now, inform the user to run serve manually.
+    try stdout.print("To run the zest server:\n", .{});
+    try stdout.print("  zest serve &\n", .{});
+    try stdout.print("\nOr use a process manager:\n", .{});
+    try stdout.print("  systemctl --user start zest\n", .{});
+}
+
+fn cmdStop(allocator: std.mem.Allocator, io: Io, environ: std.process.Environ, stdout: *Io.Writer, stderr: *Io.Writer) !void {
+    var cfg = try config.Config.init(allocator, io, environ);
+    defer cfg.deinit();
+
+    const pid_str = readPidFile(allocator, io, cfg.pid_file_path) orelse {
+        try stderr.print("No running zest server found.\n", .{});
+        return;
+    };
+    defer allocator.free(pid_str);
+
+    // Try HTTP stop first
+    var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer http_client.deinit();
+
+    const stop_url = std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/v1/stop", .{cfg.http_port}) catch {
+        try stderr.print("Failed to construct stop URL.\n", .{});
+        return;
+    };
+    defer allocator.free(stop_url);
+
+    var aw: Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    const result = http_client.fetch(.{
+        .location = .{ .url = stop_url },
+        .method = .POST,
+        .response_writer = &aw.writer,
+    }) catch {
+        try stderr.print("Failed to connect to zest server. It may have already stopped.\n", .{});
+        removePidFile(io, cfg.pid_file_path);
+        return;
+    };
+
+    if (result.status == .ok) {
+        try stdout.print("zest server stopped (was PID {s}).\n", .{pid_str});
+    } else {
+        try stderr.print("Server returned status {d}.\n", .{@intFromEnum(result.status)});
+    }
+
+    removePidFile(io, cfg.pid_file_path);
+}
+
+fn writePidFile(io: Io, path: []const u8) !void {
+    const pid = std.os.linux.getpid();
+    var buf: [20]u8 = undefined;
+    const pid_str = std.fmt.bufPrint(&buf, "{d}", .{pid}) catch return;
+    storage.writeFileAtomic(io, path, pid_str) catch {};
+}
+
+fn removePidFile(io: Io, path: []const u8) void {
+    Io.Dir.deleteFileAbsolute(io, path) catch {};
+}
+
+fn readPidFile(allocator: std.mem.Allocator, io: Io, path: []const u8) ?[]u8 {
+    const file = Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+    defer file.close(io);
+
+    var buf: [20]u8 = undefined;
+    var reader = file.reader(io, &.{});
+    const n = reader.interface.readSliceShort(&buf) catch return null;
+    const content = std.mem.trim(u8, buf[0..n], &std.ascii.whitespace);
+    if (content.len == 0) return null;
+    return allocator.dupe(u8, content) catch null;
+}
+
 /// Build the output path for a file in the HF cache layout.
 fn buildOutputPath(
     allocator: std.mem.Allocator,
@@ -364,12 +528,16 @@ fn printUsage(w: *Io.Writer) void {
         \\Usage:
         \\  zest pull <repo_id> [options]    Download a model
         \\  zest seed [options]              Seed cached xorbs to peers
+        \\  zest serve [options]             Run server (BT + HTTP API)
+        \\  zest start                       Start server in background
+        \\  zest stop                        Stop background server
         \\  zest bench [options]             Run benchmarks
         \\  zest version                     Show version
         \\  zest help                        Show this help
         \\
         \\Pull options:
         \\  --revision, -r <ref>     Git revision (default: main)
+        \\  --peer, -p <ip:port>     Direct peer address (repeatable)
         \\  --tracker, -t <url>      BT tracker URL for peer discovery
         \\  --dht-port <port>        DHT UDP port (default: 6881)
         \\  --listen, -l <addr>      Listen address for P2P (default: 0.0.0.0:6881)
@@ -380,6 +548,10 @@ fn printUsage(w: *Io.Writer) void {
         \\  --dht-port <port>        DHT UDP port (default: 6881)
         \\  --listen, -l <addr>      Listen address (default: 0.0.0.0:6881)
         \\
+        \\Serve options:
+        \\  --http-port <port>       HTTP API port (default: 9847)
+        \\  --listen-port <port>     BT listen port (default: 6881)
+        \\
         \\Bench options:
         \\  --synthetic              Run synthetic benchmarks
         \\  --json                   Output results as JSON
@@ -387,7 +559,9 @@ fn printUsage(w: *Io.Writer) void {
         \\Examples:
         \\  zest pull meta-llama/Llama-3.1-8B
         \\  zest pull Qwen/Qwen2-7B --revision v1.0 --no-p2p
+        \\  zest pull gpt2 --peer 10.0.0.5:6881
         \\  zest seed --tracker http://tracker.example.com:6881
+        \\  zest serve --http-port 8080
         \\  zest bench --synthetic --json
         \\
     , .{}) catch {};

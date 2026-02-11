@@ -142,6 +142,59 @@ pub fn hasChunk(io: Io, cfg_ptr: *const config.Config, chunk_hash: [32]u8) bool 
     return true;
 }
 
+// ── Xorb Registry ──
+
+/// In-memory index of cached xorbs for fast seeding lookups.
+pub const XorbRegistry = struct {
+    allocator: std.mem.Allocator,
+    entries: std.StringHashMap(void),
+
+    pub fn init(allocator: std.mem.Allocator) XorbRegistry {
+        return .{
+            .allocator = allocator,
+            .entries = std.StringHashMap(void).init(allocator),
+        };
+    }
+
+    /// Scan the xorb cache directory and populate the registry.
+    pub fn scan(self: *XorbRegistry, cfg: *const config.Config) !void {
+        const cached = try listCachedXorbs(self.allocator, cfg);
+        defer {
+            for (cached) |h| self.allocator.free(h);
+            self.allocator.free(cached);
+        }
+
+        for (cached) |h| {
+            const duped = try self.allocator.dupe(u8, h);
+            self.entries.put(duped, {}) catch {
+                self.allocator.free(duped);
+            };
+        }
+    }
+
+    pub fn has(self: *const XorbRegistry, hash_hex: []const u8) bool {
+        return self.entries.contains(hash_hex);
+    }
+
+    pub fn add(self: *XorbRegistry, hash_hex: []const u8) !void {
+        if (self.entries.contains(hash_hex)) return;
+        const duped = try self.allocator.dupe(u8, hash_hex);
+        try self.entries.put(duped, {});
+    }
+
+    pub fn count(self: *const XorbRegistry) u32 {
+        return self.entries.count();
+    }
+
+    pub fn deinit(self: *XorbRegistry) void {
+        var it = self.entries.keyIterator();
+        while (it.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.entries.deinit();
+    }
+};
+
 /// List all xorb hashes in the local cache (for seeding).
 pub fn listCachedXorbs(allocator: std.mem.Allocator, cfg: *const config.Config) ![][]const u8 {
     const io = cfg.io;

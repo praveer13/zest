@@ -18,6 +18,8 @@ const peer_id_mod = @import("peer_id.zig");
 const bt_peer_mod = @import("bt_peer.zig");
 const bt_tracker_mod = @import("bt_tracker.zig");
 const dht_mod = @import("dht.zig");
+const peer_pool_mod = @import("peer_pool.zig");
+const Blake3 = std.crypto.hash.Blake3;
 
 /// Reconstruction term: references a range of chunks within a xorb.
 pub const Term = struct {
@@ -131,6 +133,12 @@ pub const SwarmDownloader = struct {
     dht_client: ?dht_mod.Dht,
     bt_tracker: ?bt_tracker_mod.BtTrackerClient,
     enable_p2p: bool,
+    // Connection pool for reuse across xorbs
+    peer_pool: peer_pool_mod.PeerPool,
+    // Optional xorb registry for seed-while-downloading
+    xorb_registry: ?*storage.XorbRegistry,
+    // Direct peers specified via --peer flag (tried before DHT/tracker)
+    direct_peers: std.ArrayList(net.IpAddress),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -168,13 +176,23 @@ pub const SwarmDownloader = struct {
             .dht_client = dht_client,
             .bt_tracker = bt_tracker,
             .enable_p2p = enable_p2p,
+            .peer_pool = peer_pool_mod.PeerPool.init(allocator, io, cfg_ptr.peer_id, cfg_ptr.listen_port, cfg_ptr.max_peers),
+            .xorb_registry = null,
+            .direct_peers = .empty,
         };
+    }
+
+    /// Add a direct peer address (from --peer flag).
+    pub fn addDirectPeer(self: *SwarmDownloader, address: net.IpAddress) !void {
+        try self.direct_peers.append(self.allocator, address);
     }
 
     pub fn deinit(self: *SwarmDownloader) void {
         self.http_client.deinit();
         if (self.dht_client) |*d| d.deinit();
         if (self.bt_tracker) |*t| t.deinit();
+        self.peer_pool.deinit();
+        self.direct_peers.deinit(self.allocator);
     }
 
     /// Download all xorbs needed for a file's reconstruction.
@@ -213,11 +231,26 @@ pub const SwarmDownloader = struct {
         self.stats.cdn_bytes += data.len;
         self.stats.total_bytes += data.len;
         self.stats.cdn_chunks += 1;
+
+        // Seed-while-downloading: register in xorb registry immediately
+        if (self.xorb_registry) |registry| {
+            registry.add(hex) catch {};
+        }
     }
 
     /// Try to download a xorb via BT peers (DHT + tracker discovery).
+    /// Uses connection pool to reuse existing connections.
     fn tryBtPeerDownload(self: *SwarmDownloader, term: *const Term) bool {
         const info_hash = peer_id_mod.computeInfoHash(term.xorb_hash);
+
+        // Collect peer addresses from all discovery sources
+        var peer_addrs: std.ArrayList(net.IpAddress) = .empty;
+        defer peer_addrs.deinit(self.allocator);
+
+        // Direct peers first (from --peer flag)
+        for (self.direct_peers.items) |addr| {
+            peer_addrs.append(self.allocator, addr) catch {};
+        }
 
         // Discover peers via DHT
         if (self.dht_client) |*d| {
@@ -226,47 +259,52 @@ pub const SwarmDownloader = struct {
             defer if (peers.len > 0) self.allocator.free(peers);
 
             for (peers) |peer| {
-                if (self.tryBtChunkDownload(peer.address, info_hash, term)) {
-                    return true;
-                }
+                peer_addrs.append(self.allocator, peer.address) catch {};
             }
         }
 
         // Discover peers via BT tracker
         if (self.bt_tracker) |*t| {
-            const resp = t.announce(info_hash, self.cfg.listen_port, .started) catch return false;
+            const resp = t.announce(info_hash, self.cfg.listen_port, .started) catch {
+                return self.tryPeersSequential(peer_addrs.items, info_hash, term);
+            };
             defer @constCast(&resp).deinit();
 
             for (resp.peers) |peer| {
-                if (self.tryBtChunkDownload(peer.address, info_hash, term)) {
-                    return true;
-                }
+                peer_addrs.append(self.allocator, peer.address) catch {};
             }
         }
 
+        return self.tryPeersSequential(peer_addrs.items, info_hash, term);
+    }
+
+    /// Try downloading from multiple peers, using the connection pool.
+    fn tryPeersSequential(self: *SwarmDownloader, addrs: []const net.IpAddress, info_hash: [20]u8, term: *const Term) bool {
+        for (addrs) |address| {
+            if (self.tryPooledChunkDownload(address, info_hash, term)) {
+                return true;
+            }
+        }
         return false;
     }
 
-    /// Try to download xorb data from a single BT peer.
-    fn tryBtChunkDownload(self: *SwarmDownloader, address: net.IpAddress, info_hash: [20]u8, term: *const Term) bool {
-        var peer = bt_peer_mod.BtPeer.connect(
-            self.allocator,
-            self.io,
-            address,
-            info_hash,
-            self.our_peer_id,
-            self.cfg.listen_port,
-        ) catch return false;
-        defer peer.deinit();
-
-        peer.performHandshake() catch return false;
+    /// Try to download xorb data from a single BT peer, using the connection pool.
+    fn tryPooledChunkDownload(self: *SwarmDownloader, address: net.IpAddress, info_hash: [20]u8, term: *const Term) bool {
+        const peer = self.peer_pool.getOrConnect(address, info_hash) catch return false;
 
         if (!peer.supports_xet) return false;
 
         self.stats.peers_connected += 1;
 
-        // Request the xorb as a single chunk (simplified — full chunk-level splitting comes later)
-        const data = peer.requestChunk(term.xorb_hash) catch return false;
+        // Request the xorb chunk
+        const data = peer.requestChunk(term.xorb_hash) catch |err| {
+            // Connection error — remove from pool so next attempt reconnects
+            switch (err) {
+                error.ChunkNotFound, error.ChunkError, error.ChunkHashMismatch => {},
+                else => self.peer_pool.remove(address),
+            }
+            return false;
+        };
         defer self.allocator.free(data);
 
         // Cache and record stats
@@ -275,6 +313,11 @@ pub const SwarmDownloader = struct {
         self.stats.peer_bytes += data.len;
         self.stats.total_bytes += data.len;
         self.stats.peer_chunks += 1;
+
+        // Seed-while-downloading: register in xorb registry immediately
+        if (self.xorb_registry) |registry| {
+            registry.add(&term.xorb_hash_hex) catch {};
+        }
 
         // Announce to DHT that we now have this xorb
         if (self.dht_client) |*d| {

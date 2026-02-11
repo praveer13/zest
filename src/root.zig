@@ -23,7 +23,10 @@ pub const bep_xet = @import("bep_xet.zig");
 pub const bt_peer = @import("bt_peer.zig");
 pub const dht = @import("dht.zig");
 pub const bt_tracker = @import("bt_tracker.zig");
+pub const peer_pool = @import("peer_pool.zig");
 pub const bench = @import("bench.zig");
+pub const server = @import("server.zig");
+pub const http_api = @import("http_api.zig");
 
 test {
     // Run tests from all modules

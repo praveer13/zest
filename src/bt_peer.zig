@@ -186,6 +186,73 @@ pub const BtPeer = struct {
         }
     }
 
+    /// Send multiple CHUNK_REQUESTs without waiting for responses (pipelining).
+    /// Returns the request IDs assigned to each request.
+    pub fn sendChunkRequests(self: *BtPeer, chunk_hashes: []const [32]u8) ![]u32 {
+        const ext_id = self.remote_xet_ext_id orelse return error.NoBepXetSupport;
+
+        var sw = self.stream.writer(self.io, &self.write_buf);
+        const writer = &sw.interface;
+
+        const request_ids = try self.allocator.alloc(u32, chunk_hashes.len);
+        errdefer self.allocator.free(request_ids);
+
+        for (chunk_hashes, 0..) |hash, i| {
+            request_ids[i] = self.next_request_id;
+            self.next_request_id += 1;
+            try bep_xet.encodeChunkRequest(writer, ext_id, request_ids[i], hash);
+        }
+        try writer.flush();
+        return request_ids;
+    }
+
+    /// Receive the next chunk response from the peer.
+    /// Handles control messages inline while waiting.
+    pub fn receiveChunkResponse(self: *BtPeer) !ChunkResult {
+        var sr = self.stream.reader(self.io, &self.read_buf);
+        const reader = &sr.interface;
+
+        while (true) {
+            const msg = (try bt_wire.readMessage(reader, self.allocator)) orelse continue;
+
+            if (msg.msg_id != .extended) {
+                switch (msg.msg_id) {
+                    .unchoke => self.peer_choking = false,
+                    .choke => self.peer_choking = true,
+                    else => {},
+                }
+                if (msg.payload.len > 0) self.allocator.free(msg.payload);
+                continue;
+            }
+
+            defer if (msg.payload.len > 0) self.allocator.free(msg.payload);
+
+            const ext = bt_wire.parseExtended(msg.payload) catch continue;
+            const xet_msg = bep_xet.decodeMessage(ext.data) catch continue;
+
+            switch (xet_msg) {
+                .chunk_response => |resp| {
+                    return .{
+                        .request_id = resp.request_id,
+                        .data = try self.allocator.dupe(u8, resp.data),
+                    };
+                },
+                .chunk_not_found => |nf| {
+                    return .{ .request_id = nf.request_id, .data = null };
+                },
+                .chunk_error => |ce| {
+                    return .{ .request_id = ce.request_id, .data = null };
+                },
+                .chunk_request => {},
+            }
+        }
+    }
+
+    pub const ChunkResult = struct {
+        request_id: u32,
+        data: ?[]u8,
+    };
+
     /// Handle an incoming message (for seeding). Returns the parsed XET message
     /// if it's a chunk request, null for control messages.
     pub fn handleIncoming(self: *BtPeer) !?bep_xet.XetMessage {

@@ -7,6 +7,8 @@ pub const hf_hub_url = "https://huggingface.co";
 pub const default_revision = "main";
 pub const default_dht_port: u16 = 6881;
 pub const default_listen_port: u16 = 6881;
+pub const default_http_port: u16 = 9847;
+pub const default_max_peers: u16 = 50;
 pub const default_chunk_target_size: u32 = 65536; // 64KB — matches HF Xet CDC chunk size
 
 /// Well-known BT DHT bootstrap nodes.
@@ -26,7 +28,10 @@ pub const Config = struct {
     peer_id: [20]u8,
     dht_port: u16,
     listen_port: u16,
+    http_port: u16,
+    max_peers: u16,
     chunk_target_size: u32,
+    pid_file_path: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, io: Io, environ: Environ) !Config {
         const home = environ.getPosix("HOME") orelse "/root";
@@ -44,8 +49,20 @@ pub const Config = struct {
 
         const xorb_cache_dir = try std.fmt.allocPrint(allocator, "{s}/xorbs", .{cache_dir});
         const chunk_cache_dir = try std.fmt.allocPrint(allocator, "{s}/chunks", .{cache_dir});
+        const pid_file_path = try std.fmt.allocPrint(allocator, "{s}/zest.pid", .{cache_dir});
 
         const hf_token = try readHfToken(allocator, io, environ, home);
+
+        // Parse optional env var overrides
+        const http_port = if (environ.getPosix("ZEST_HTTP_PORT")) |p|
+            std.fmt.parseInt(u16, p, 10) catch default_http_port
+        else
+            default_http_port;
+
+        const max_peers = if (environ.getPosix("ZEST_MAX_PEERS")) |p|
+            std.fmt.parseInt(u16, p, 10) catch default_max_peers
+        else
+            default_max_peers;
 
         return .{
             .allocator = allocator,
@@ -58,12 +75,16 @@ pub const Config = struct {
             .peer_id = peer_id_mod.generate(io),
             .dht_port = default_dht_port,
             .listen_port = default_listen_port,
+            .http_port = http_port,
+            .max_peers = max_peers,
             .chunk_target_size = default_chunk_target_size,
+            .pid_file_path = pid_file_path,
         };
     }
 
     pub fn deinit(self: *Config) void {
         if (self.hf_token) |token| self.allocator.free(token);
+        self.allocator.free(self.pid_file_path);
         self.allocator.free(self.xorb_cache_dir);
         self.allocator.free(self.chunk_cache_dir);
         self.allocator.free(self.cache_dir);

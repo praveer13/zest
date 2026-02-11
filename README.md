@@ -3,9 +3,9 @@
 **P2P acceleration for ML model distribution.**
 
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
-[![Tests](https://img.shields.io/badge/tests-58%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-65%20passing-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
-[![Lines of Code](https://img.shields.io/badge/lines-3%2C670-informational)](#project-structure)
+[![Lines of Code](https://img.shields.io/badge/lines-4%2C563-informational)](#project-structure)
 
 zest speaks HuggingFace's [Xet protocol](https://huggingface.co/docs/xet/index) (via [zig-xet](https://github.com/jedisct1/zig-xet)) for content addressing and [BitTorrent](https://www.bittorrent.org/beps/bep_0003.html) (BEP 3 / BEP 10 / [BEP XET](https://ccbittorrent.readthedocs.io/en/latest/bep_xet/)) for peer-to-peer transfer. Models download from nearby peers first, fall back to HF's CDN.
 
@@ -35,13 +35,33 @@ Requires [Zig 0.16.0+](https://ziglang.org/download/).
 git clone https://github.com/praveer13/zest.git
 cd zest
 zig build -Doptimize=ReleaseFast
-# binary at ./zig-out/bin/zest (~7 MB static binary)
+# binary at ./zig-out/bin/zest (~9 MB static binary)
 ```
 
-### Python (coming soon)
+### Python package
 
 ```bash
-pip install zest
+# build the wheel (bundles the Zig binary)
+./scripts/build-wheel.sh
+
+# install
+pip install python/dist/zest_transfer-0.3.0-py3-none-any.whl
+# or
+uv pip install python/dist/zest_transfer-0.3.0-py3-none-any.whl
+```
+
+From Python:
+
+```python
+import zest
+
+zest.enable()   # monkey-patches huggingface_hub for P2P downloads
+zest.pull("meta-llama/Llama-3.1-8B")  # download via P2P + CDN
+zest.status()   # server stats
+zest.stop()     # stop the server
+
+# or auto-enable via env var:
+# ZEST=1 python your_script.py
 ```
 
 ## Usage
@@ -55,12 +75,36 @@ zest pull meta-llama/Llama-3.1-8B
 # specific revision
 zest pull Qwen/Qwen2-7B --revision v1.0
 
+# direct peer connection (no tracker/DHT needed)
+zest pull gpt2 --peer 10.0.0.5:6881
+
 # with BT tracker for peer discovery
 zest pull meta-llama/Llama-3.1-8B --tracker http://tracker.example.com:6881
 
 # CDN-only (disable P2P)
 zest pull meta-llama/Llama-3.1-8B --no-p2p
 ```
+
+### Server mode
+
+```bash
+# run server in foreground (BT listener on :6881, HTTP API on :9847)
+zest serve
+
+# custom ports
+zest serve --http-port 8080 --listen-port 7000
+
+# start/stop as background service
+zest start
+zest stop
+```
+
+The HTTP API provides:
+
+- `GET /v1/health` — health check
+- `GET /v1/status` — JSON stats (peers, chunks served, xorbs cached)
+- `POST /v1/pull` — trigger model download
+- `POST /v1/stop` — graceful shutdown
 
 ### Seed your downloads
 
@@ -86,6 +130,98 @@ zest version    # print version
 zest help       # show usage
 ```
 
+## Testing P2P Between Two Servers
+
+This is the quickest way to verify end-to-end P2P transfer works.
+
+### 1. Build the wheel
+
+On your dev machine (requires Zig 0.16):
+
+```bash
+./scripts/build-wheel.sh
+# output: python/dist/zest_transfer-0.3.0-py3-none-any.whl (~2.5 MB)
+```
+
+For ARM servers, cross-compile:
+
+```bash
+./scripts/build-wheel.sh aarch64-linux
+```
+
+### 2. Install on both servers
+
+```bash
+scp python/dist/zest_transfer-0.3.0-py3-none-any.whl server-a:
+scp python/dist/zest_transfer-0.3.0-py3-none-any.whl server-b:
+
+# on each server:
+pip install zest_transfer-0.3.0-py3-none-any.whl
+```
+
+### 3. Server A: download and seed
+
+```bash
+# download a small model from HF (CDN)
+zest pull gpt2
+
+# start seeding (BT listener on :6881, HTTP API on :9847)
+zest serve
+```
+
+### 4. Server B: download from Server A via P2P
+
+```bash
+# --peer tells zest to try Server A directly
+zest pull gpt2 --peer <server-a-ip>:6881
+```
+
+The output will show download stats including how much came from peers vs CDN.
+
+### Python workflow
+
+Same test, but from Python:
+
+```python
+# server_a.py
+import zest
+zest.pull("gpt2")  # downloads from CDN, auto-starts server, seeds
+
+# server_b.py — once Server A is running
+import subprocess
+subprocess.run(["zest", "pull", "gpt2", "--peer", "<server-a-ip>:6881"])
+```
+
+Or with the programmatic API:
+
+```python
+# server A
+import zest
+zest.pull("gpt2")
+
+# check status
+print(zest.status())
+# {"version": "0.3.0", "bt_peers": 0, "chunks_served": 0, "xorbs_cached": 12, ...}
+```
+
+### Verify P2P is working
+
+On Server B, check the download stats output:
+
+```
+Download stats:
+  From peers:      12     ← chunks came from Server A
+  From CDN:        0      ← nothing from HF servers
+  P2P ratio:       100.0%
+```
+
+On Server A, check the HTTP API:
+
+```bash
+curl http://localhost:9847/v1/status
+# {"version":"0.3.0","bt_peers":1,"chunks_served":12,...}
+```
+
 ## How It Works
 
 ```
@@ -95,6 +231,7 @@ zest help       # show usage
 │  1. zig-xet: list files, detect Xet-backed files         │
 │  2. For each xorb:                                       │
 │     ✓ Check local cache (~/.cache/zest/xorbs/)           │
+│     ✓ Try direct peers (--peer flag)                     │
 │     ✓ DHT get_peers(info_hash) + BT tracker announce     │
 │     ✓ BT handshake → BEP 10 → BEP XET CHUNK_REQUEST     │
 │     ✓ Download chunks from peers (P2P)                   │
@@ -125,6 +262,8 @@ This means zest peers can interoperate with any BEP XET-compliant client, includ
 - **No trust required for peers** — BLAKE3 hash verification on every chunk.
 - **HF cache compatible** — writes to `~/.cache/huggingface/hub/` so all existing tooling works.
 - **64KB chunks** — matches HuggingFace Xet's CDC parameters for content-level interop.
+- **Connection pooling** — persistent BT connections reused across xorb downloads.
+- **Seed-while-downloading** — newly downloaded xorbs are immediately available for serving to other peers.
 
 ## Project Structure
 
@@ -135,42 +274,35 @@ zest/
 ├── DESIGN.md              Design document (architecture, roadmap, BEP XET details)
 ├── CLAUDE.md              AI assistant context
 ├── README.md              This file
+├── scripts/
+│   └── build-wheel.sh     Build Zig binary + Python wheel
+├── python/
+│   ├── pyproject.toml      Python package metadata
+│   └── zest/
+│       ├── __init__.py     Public API: enable(), pull(), status(), stop()
+│       ├── server.py       Zig binary lifecycle management
+│       ├── client.py       HTTP client for localhost API
+│       └── hf_backend.py   huggingface_hub monkey-patch
 ├── .github/workflows/
 │   └── ci.yml             CI: build, test, lint, benchmark, metrics
 └── src/
-    ├── main.zig           CLI entry: pull, seed, bench, version, help
+    ├── main.zig           CLI: pull, seed, serve, start, stop, bench
     ├── root.zig           Library root, re-exports all modules
     ├── config.zig         Cache dirs, HF token, DHT config, peer ID
     ├── bencode.zig        Bencode encoder/decoder (BT message serialization)
     ├── peer_id.zig        BT peer ID generation + SHA-1 info_hash
     ├── bt_wire.zig        BT wire protocol (BEP 3 + BEP 10 framing)
     ├── bep_xet.zig        BEP XET extension (4 message types)
-    ├── bt_peer.zig        BT peer connection lifecycle + state machine
+    ├── bt_peer.zig        BT peer connection lifecycle + pipelining
+    ├── peer_pool.zig      Connection pool for BT peer reuse
     ├── dht.zig            Kademlia DHT (BEP 5) for peer discovery
     ├── bt_tracker.zig     Standard BT HTTP tracker client
     ├── swarm.zig          Download orchestrator (cache→peers→CDN)
-    ├── storage.zig        File I/O, HF cache refs, xorb/chunk cache
+    ├── storage.zig        File I/O, HF cache refs, xorb/chunk cache, XorbRegistry
+    ├── server.zig         BT TCP listener for seeding chunks
+    ├── http_api.zig       HTTP REST API for Python integration
     └── bench.zig          Synthetic benchmarks with JSON output
 ```
-
-### Module Metrics
-
-| Module | Lines | Tests | Purpose |
-|--------|------:|------:|---------|
-| `dht.zig` | 671 | 11 | Kademlia DHT — routing table, KRPC, UDP |
-| `main.zig` | 399 | 1 | CLI entry, command routing |
-| `bencode.zig` | 368 | 12 | Bencode encoder/decoder |
-| `bep_xet.zig` | 349 | 6 | BEP XET chunk transfer messages |
-| `swarm.zig` | 334 | — | Download orchestration |
-| `bench.zig` | 311 | 2 | Benchmarking framework |
-| `bt_wire.zig` | 274 | 8 | BT wire protocol framing |
-| `bt_peer.zig` | 274 | 3 | BT peer connections |
-| `bt_tracker.zig` | 260 | 5 | BT HTTP tracker client |
-| `storage.zig` | 175 | — | File I/O, caching |
-| `config.zig` | 161 | 3 | Configuration |
-| `peer_id.zig` | 63 | 5 | Peer ID + info_hash |
-| `root.zig` | 31 | 2 | Library re-exports |
-| **Total** | **3,670** | **58** | |
 
 ## Performance
 
@@ -189,7 +321,7 @@ Run benchmarks: `zest bench --synthetic` or `zest bench --synthetic --json` for 
 ## Testing
 
 ```bash
-# run all tests (58 tests across 13 modules)
+# run all tests (65 tests across 16 modules)
 zig build test --summary all
 
 # check formatting
@@ -202,7 +334,7 @@ zig fmt --check src/
 # build (debug)
 zig build
 
-# build (release, ~7 MB binary)
+# build (release, ~9 MB static binary)
 zig build -Doptimize=ReleaseFast
 
 # run directly
@@ -210,6 +342,9 @@ zig build run -- pull meta-llama/Llama-3.1-8B
 
 # run tests
 zig build test --summary all
+
+# build Python wheel
+./scripts/build-wheel.sh
 ```
 
 ### Authentication
@@ -227,13 +362,14 @@ zest reads your HuggingFace token from (in order):
 | `~/.cache/huggingface/hub/models--{org}--{name}/refs/main` | Commit SHA ref |
 | `~/.cache/zest/xorbs/{prefix}/{hash}` | Downloaded xorbs (for seeding) |
 | `~/.cache/zest/chunks/{prefix}/{hash}` | Individual chunks (for BEP XET serving) |
+| `~/.cache/zest/zest.pid` | PID file for background server |
 
 ## Roadmap
 
-- [x] **Phase 1: BT-Compliant P2P Core** — BEP 3/5/10/XET, DHT, bencode, benchmarks (58 tests)
-- [ ] **Phase 2: Server Mode** — REST API, TCP listener, daemon lifecycle
-- [ ] **Phase 3: Transfer Optimizations** — pipelining, multi-peer, io_uring batch, reciprocity
-- [ ] **Phase 4: Python Package** — `pip install zest`, HF backend hook, Jupyter magic
+- [x] **Phase 1: BT-Compliant P2P Core** — BEP 3/5/10/XET, DHT, bencode, benchmarks
+- [x] **Phase 2: Server Mode** — BT TCP listener, HTTP REST API, serve/start/stop commands
+- [x] **Phase 3: Transfer Optimizations** — connection pooling, request pipelining, seed-while-downloading
+- [x] **Phase 4: Python Package** — `pip install zest`, HF backend hook, auto-enable via `ZEST=1`
 - [ ] **Phase 5: Ecosystem** — vLLM, Ollama, llama.cpp integrations
 
 See [DESIGN.md](DESIGN.md) for the full design document with architecture, BEP XET compliance details, and UX plans.
