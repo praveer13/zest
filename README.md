@@ -27,30 +27,15 @@ When a popular model drops, tens of thousands of people download the same immuta
 
 ## Installation
 
-### From source
-
-Requires [Zig 0.16.0+](https://ziglang.org/download/).
-
 ```bash
-git clone https://github.com/praveer13/zest.git
-cd zest
-zig build -Doptimize=ReleaseFast
-# binary at ./zig-out/bin/zest (~9 MB static binary)
-```
-
-### Python package
-
-```bash
-# build the wheel (bundles the Zig binary)
-./scripts/build-wheel.sh
-
-# install
-pip install python/dist/zest_transfer-0.3.0-py3-none-any.whl
+pip install zest-transfer
 # or
-uv pip install python/dist/zest_transfer-0.3.0-py3-none-any.whl
+uv pip install zest-transfer
 ```
 
-From Python:
+This installs the `zest` CLI and the Python library. No Zig toolchain needed.
+
+### Python API
 
 ```python
 import zest
@@ -62,6 +47,17 @@ zest.stop()     # stop the server
 
 # or auto-enable via env var:
 # ZEST=1 python your_script.py
+```
+
+### From source (for contributors)
+
+Requires [Zig 0.16.0+](https://ziglang.org/download/).
+
+```bash
+git clone https://github.com/praveer13/zest.git
+cd zest
+zig build -Doptimize=ReleaseFast
+# binary at ./zig-out/bin/zest (~9 MB static binary)
 ```
 
 ## Usage
@@ -134,32 +130,14 @@ zest help       # show usage
 
 This is the quickest way to verify end-to-end P2P transfer works.
 
-### 1. Build the wheel
-
-On your dev machine (requires Zig 0.16):
+### 1. Install on both servers
 
 ```bash
-./scripts/build-wheel.sh
-# output: python/dist/zest_transfer-0.3.0-py3-none-any.whl (~2.5 MB)
-```
-
-For ARM servers, cross-compile:
-
-```bash
-./scripts/build-wheel.sh aarch64-linux
-```
-
-### 2. Install on both servers
-
-```bash
-scp python/dist/zest_transfer-0.3.0-py3-none-any.whl server-a:
-scp python/dist/zest_transfer-0.3.0-py3-none-any.whl server-b:
-
 # on each server:
-pip install zest_transfer-0.3.0-py3-none-any.whl
+pip install zest-transfer
 ```
 
-### 3. Server A: download and seed
+### 2. Server A: download and seed
 
 ```bash
 # download a small model from HF (CDN)
@@ -169,7 +147,7 @@ zest pull gpt2
 zest serve
 ```
 
-### 4. Server B: download from Server A via P2P
+### 3. Server B: download from Server A via P2P
 
 ```bash
 # --peer tells zest to try Server A directly
@@ -201,7 +179,7 @@ zest.pull("gpt2")
 
 # check status
 print(zest.status())
-# {"version": "0.3.0", "bt_peers": 0, "chunks_served": 0, "xorbs_cached": 12, ...}
+# {"version": "0.3.1", "bt_peers": 0, "chunks_served": 0, "xorbs_cached": 12, ...}
 ```
 
 ### Verify P2P is working
@@ -342,9 +320,6 @@ zig build run -- pull meta-llama/Llama-3.1-8B
 
 # run tests
 zig build test --summary all
-
-# build Python wheel
-./scripts/build-wheel.sh
 ```
 
 ### Authentication
