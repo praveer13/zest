@@ -65,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, command, "serve")) {
         try cmdServe(allocator, init, stdout, stderr, args[2..]);
     } else if (std.mem.eql(u8, command, "start")) {
-        try cmdStart(allocator, io, init.minimal.environ, stdout, stderr);
+        try cmdStart(allocator, io, init, stdout, stderr);
     } else if (std.mem.eql(u8, command, "stop")) {
         try cmdStop(allocator, io, init.minimal.environ, stdout, stderr);
     } else if (std.mem.eql(u8, command, "version")) {
@@ -238,6 +238,11 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
         try stderr.print("Warning: failed to write ref: {}\n", .{err});
     };
 
+    // Auto-start background server for seeding (if not already running)
+    if (enable_p2p) {
+        autoStartServer(allocator, io, init, &cfg, stdout);
+    }
+
     downloader.printStats(stdout);
     try stdout.print("\nDone! Model available at:\n", .{});
 
@@ -391,23 +396,57 @@ fn cmdServe(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wr
     try stdout.print("\nServer stopped.\n", .{});
 }
 
-fn cmdStart(allocator: std.mem.Allocator, io: Io, environ: std.process.Environ, stdout: *Io.Writer, stderr: *Io.Writer) !void {
-    var cfg = try config.Config.init(allocator, io, environ);
+fn cmdStart(allocator: std.mem.Allocator, io: Io, init: std.process.Init, stdout: *Io.Writer, stderr: *Io.Writer) !void {
+    var cfg = try config.Config.init(allocator, io, init.minimal.environ);
     defer cfg.deinit();
 
-    // Check if already running
-    if (readPidFile(allocator, io, cfg.pid_file_path)) |pid_str| {
-        defer allocator.free(pid_str);
-        try stderr.print("zest is already running (PID {s}). Use `zest stop` first.\n", .{pid_str});
+    // Check if already running via health check
+    if (isServerRunning(allocator, io, cfg.http_port)) {
+        try stderr.print("zest server is already running on port {d}.\n", .{cfg.http_port});
         return;
     }
 
-    // TODO: Spawn `zest serve` as a detached child process.
-    // For now, inform the user to run serve manually.
-    try stdout.print("To run the zest server:\n", .{});
-    try stdout.print("  zest serve &\n", .{});
-    try stdout.print("\nOr use a process manager:\n", .{});
-    try stdout.print("  systemctl --user start zest\n", .{});
+    autoStartServer(allocator, io, init, &cfg, stdout);
+}
+
+/// Spawn `zest serve` as a detached background process if not already running.
+fn autoStartServer(allocator: std.mem.Allocator, io: Io, init: std.process.Init, cfg: *const config.Config, stdout: *Io.Writer) void {
+    // Already running? Skip.
+    if (isServerRunning(allocator, io, cfg.http_port)) return;
+
+    // Get our own binary path from argv[0]
+    const all_args = init.minimal.args.toSlice(init.arena.allocator()) catch return;
+    if (all_args.len == 0) return;
+    const exe_path: []const u8 = all_args[0];
+
+    // Spawn detached: zest serve
+    _ = std.process.spawn(io, .{
+        .argv = &.{ exe_path, "serve" },
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .stdin = .ignore,
+    }) catch return;
+
+    stdout.print("Auto-started background server for seeding (BT :6881, HTTP :{d})\n", .{cfg.http_port}) catch {};
+}
+
+/// Check if zest server is running by hitting the health endpoint.
+fn isServerRunning(allocator: std.mem.Allocator, io: Io, http_port: u16) bool {
+    var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer http_client.deinit();
+
+    const url = std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/v1/health", .{http_port}) catch return false;
+    defer allocator.free(url);
+
+    var aw: Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    const result = http_client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &aw.writer,
+    }) catch return false;
+
+    return result.status == .ok;
 }
 
 fn cmdStop(allocator: std.mem.Allocator, io: Io, environ: std.process.Environ, stdout: *Io.Writer, stderr: *Io.Writer) !void {
@@ -435,7 +474,7 @@ fn cmdStop(allocator: std.mem.Allocator, io: Io, environ: std.process.Environ, s
 
     const result = http_client.fetch(.{
         .location = .{ .url = stop_url },
-        .method = .POST,
+        .payload = "",
         .response_writer = &aw.writer,
     }) catch {
         try stderr.print("Failed to connect to zest server. It may have already stopped.\n", .{});
