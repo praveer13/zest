@@ -17,7 +17,15 @@
         packages = [
           zig-overlay.packages.${system}.master
           zls-overlay.packages.${system}.default
+          pkgs.python312
+          pkgs.python312Packages.pip
+          pkgs.python312Packages.transformers
+          pkgs.python312Packages.torch
         ];
+
+        shellHook = ''
+          export PATH="$PWD/zig-out/bin:$PATH"
+        '';
       };
     };
 }
