@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zest-transfer"
-version = "0.3.3"
+version = "0.3.4"
 description = "P2P acceleration for ML model distribution"
 readme = "README.md"
 license = "MIT"
