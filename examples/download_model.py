@@ -1,17 +1,14 @@
 """Example: download a small model with zest and verify it works."""
 
-import subprocess
-import sys
+import zest
 
 
 def main():
     repo = "openai-community/gpt2"  # ~550 MB, smallest GPT-2
 
     print(f"Downloading {repo} via zest...")
-    result = subprocess.run(["zest", "pull", repo])
-    if result.returncode != 0:
-        print("zest pull failed", file=sys.stderr)
-        sys.exit(1)
+    path = zest.pull(repo)
+    print(f"Model at: {path}")
 
     print("\nVerifying with transformers...")
     try:

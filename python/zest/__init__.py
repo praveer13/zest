@@ -49,7 +49,6 @@ def disable() -> None:
 def pull(repo: str, revision: str = "main") -> str:
     """Download a model via zest, return the cache path."""
     _init()
-    _server.ensure_running()
     return _client.pull(repo, revision)
 
 

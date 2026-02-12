@@ -1,52 +1,49 @@
-"""HTTP client for the zest server REST API."""
+"""Client for interacting with zest — uses CLI for pull, HTTP for status."""
 
 from __future__ import annotations
 
-from typing import Callable
+import subprocess
+import sys
+from pathlib import Path
+from shutil import which
 
 import requests
 
 DEFAULT_HTTP_PORT = 9847
-REQUEST_TIMEOUT = 300.0  # 5 min for large model downloads
 
 
 class ZestClient:
-    """Communicates with the zest server over its localhost HTTP API."""
+    """Communicates with zest via CLI (pull) and HTTP API (status)."""
 
     def __init__(self, http_port: int = DEFAULT_HTTP_PORT) -> None:
         self.http_port = http_port
         self._base_url = f"http://127.0.0.1:{http_port}"
 
-    def pull(
-        self,
-        repo: str,
-        revision: str = "main",
-        callback: Callable[[dict], None] | None = None,
-    ) -> str:
-        """Trigger a model download and return the cache path.
+    def pull(self, repo: str, revision: str = "main") -> str:
+        """Download a model via the zest CLI, return the cache path.
 
         Args:
             repo: HuggingFace repo ID (e.g. "meta-llama/Llama-3.1-8B").
             revision: Git revision (default "main").
-            callback: Optional progress callback receiving event dicts.
 
         Returns:
             Path to the downloaded model snapshot directory.
         """
-        resp = requests.post(
-            f"{self._base_url}/v1/pull",
-            json={"repo": repo, "revision": revision},
-            timeout=REQUEST_TIMEOUT,
-            stream=True,
-        )
-        resp.raise_for_status()
+        binary = _find_zest_binary()
+        cmd = [binary, "pull", repo, "--revision", revision]
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            raise RuntimeError(f"zest pull failed (exit code {result.returncode})")
 
-        # When SSE streaming is implemented, parse events and call callback.
-        # For now, return the JSON response body.
-        data = resp.json()
-        if callback is not None:
-            callback(data)
-        return data.get("path", "")
+        # Return the HF cache snapshot path
+        safe_name = repo.replace("/", "--")
+        snapshots = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{safe_name}" / "snapshots"
+        if snapshots.is_dir():
+            # Return the most recent snapshot
+            dirs = sorted(snapshots.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+            if dirs:
+                return str(dirs[0])
+        return ""
 
     def status(self) -> dict:
         """Get server status."""
@@ -55,3 +52,20 @@ class ZestClient:
         )
         resp.raise_for_status()
         return resp.json()
+
+
+def _find_zest_binary() -> str:
+    """Find the zest binary."""
+    # 1. Bundled in package
+    pkg_bin = Path(__file__).parent / "_bin" / "zest"
+    if pkg_bin.is_file():
+        return str(pkg_bin)
+
+    # 2. On PATH
+    on_path = which("zest")
+    if on_path:
+        return on_path
+
+    raise FileNotFoundError(
+        "zest binary not found. Install with: pip install zest-transfer"
+    )
