@@ -104,6 +104,8 @@ pub const HttpApi = struct {
             try self.handleStop(http_server, request);
         } else if (std.mem.startsWith(u8, target, "/v1/pull")) {
             try self.handlePull(http_server, request);
+        } else if (std.mem.eql(u8, target, "/") or std.mem.eql(u8, target, "/ui")) {
+            try self.handleDashboard(http_server, request);
         } else {
             try self.sendJson(http_server, request, .not_found, "{\"error\":\"not found\"}");
         }
@@ -144,6 +146,17 @@ pub const HttpApi = struct {
         if (self.bt_server) |bs| bs.shutdown();
     }
 
+    fn handleDashboard(_: *HttpApi, _: *std.http.Server, request: std.http.Server.Request) !void {
+        var req = request;
+        try req.respond(dashboard_html, .{
+            .status = .ok,
+            .keep_alive = false,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+            },
+        });
+    }
+
     fn sendJson(_: *HttpApi, _: *std.http.Server, request: std.http.Server.Request, status: std.http.Status, body: []const u8) !void {
         var req = request;
         try req.respond(body, .{
@@ -155,6 +168,102 @@ pub const HttpApi = struct {
         });
     }
 };
+
+const dashboard_html =
+    \\<!DOCTYPE html>
+    \\<html lang="en">
+    \\<head>
+    \\<meta charset="utf-8">
+    \\<meta name="viewport" content="width=device-width, initial-scale=1">
+    \\<title>zest - P2P Seeding Status</title>
+    \\<style>
+    \\  * { margin: 0; padding: 0; box-sizing: border-box; }
+    \\  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    \\    background: #0a0a0a; color: #e0e0e0; padding: 40px 20px; }
+    \\  .container { max-width: 640px; margin: 0 auto; }
+    \\  h1 { font-size: 24px; margin-bottom: 8px; color: #fff; }
+    \\  h1 span { color: #4ade80; }
+    \\  .subtitle { color: #888; margin-bottom: 32px; font-size: 14px; }
+    \\  .card { background: #161616; border: 1px solid #2a2a2a; border-radius: 12px;
+    \\    padding: 24px; margin-bottom: 16px; }
+    \\  .card h2 { font-size: 14px; color: #888; text-transform: uppercase;
+    \\    letter-spacing: 0.5px; margin-bottom: 16px; }
+    \\  .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    \\  .stat { }
+    \\  .stat .value { font-size: 32px; font-weight: 700; color: #fff; }
+    \\  .stat .label { font-size: 13px; color: #888; margin-top: 2px; }
+    \\  .stat .value.green { color: #4ade80; }
+    \\  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    \\    margin-right: 8px; vertical-align: middle; }
+    \\  .dot.on { background: #4ade80; box-shadow: 0 0 8px #4ade8066; }
+    \\  .dot.off { background: #666; }
+    \\  .status-line { font-size: 14px; color: #aaa; margin-bottom: 24px; }
+    \\  .footer { text-align: center; color: #555; font-size: 12px; margin-top: 32px; }
+    \\  .footer a { color: #888; }
+    \\  .stop-btn { background: #2a2a2a; color: #e0e0e0; border: 1px solid #444;
+    \\    padding: 8px 20px; border-radius: 8px; cursor: pointer; font-size: 13px;
+    \\    float: right; margin-top: -4px; }
+    \\  .stop-btn:hover { background: #dc2626; color: #fff; border-color: #dc2626; }
+    \\</style>
+    \\</head>
+    \\<body>
+    \\<div class="container">
+    \\  <h1><span>zest</span> seeding status</h1>
+    \\  <div class="status-line"><span class="dot on" id="dot"></span><span id="status-text">Seeding</span>
+    \\    <button class="stop-btn" onclick="stopServer()">Stop Server</button></div>
+    \\  <div class="card">
+    \\    <h2>Network</h2>
+    \\    <div class="stat-grid">
+    \\      <div class="stat"><div class="value green" id="peers">0</div><div class="label">Connected peers</div></div>
+    \\      <div class="stat"><div class="value" id="chunks">0</div><div class="label">Chunks served</div></div>
+    \\    </div>
+    \\  </div>
+    \\  <div class="card">
+    \\    <h2>Cache</h2>
+    \\    <div class="stat-grid">
+    \\      <div class="stat"><div class="value" id="xorbs">0</div><div class="label">Xorbs cached</div></div>
+    \\      <div class="stat"><div class="value" id="requests">0</div><div class="label">HTTP requests</div></div>
+    \\    </div>
+    \\  </div>
+    \\  <div class="card">
+    \\    <h2>Server</h2>
+    \\    <div class="stat-grid">
+    \\      <div class="stat"><div class="value" id="bt-port" style="font-size:20px">-</div><div class="label">BT port</div></div>
+    \\      <div class="stat"><div class="value" id="http-port" style="font-size:20px">-</div><div class="label">HTTP port</div></div>
+    \\    </div>
+    \\  </div>
+    \\  <div class="footer">zest &mdash; P2P acceleration for ML model distribution &mdash;
+    \\    <a href="https://github.com/praveer13/zest">GitHub</a></div>
+    \\</div>
+    \\<script>
+    \\async function update() {
+    \\  try {
+    \\    const r = await fetch('/v1/status');
+    \\    const d = await r.json();
+    \\    document.getElementById('peers').textContent = d.bt_peers;
+    \\    document.getElementById('chunks').textContent = d.chunks_served;
+    \\    document.getElementById('xorbs').textContent = d.xorbs_cached;
+    \\    document.getElementById('requests').textContent = d.http_requests;
+    \\    document.getElementById('bt-port').textContent = ':' + d.bt_port;
+    \\    document.getElementById('http-port').textContent = ':' + d.http_port;
+    \\    document.getElementById('dot').className = 'dot on';
+    \\    document.getElementById('status-text').textContent = 'Seeding';
+    \\  } catch(e) {
+    \\    document.getElementById('dot').className = 'dot off';
+    \\    document.getElementById('status-text').textContent = 'Offline';
+    \\  }
+    \\}
+    \\async function stopServer() {
+    \\  if (!confirm('Stop the zest seeding server?')) return;
+    \\  try { await fetch('/v1/stop', {method:'POST'}); } catch(e) {}
+    \\  document.getElementById('dot').className = 'dot off';
+    \\  document.getElementById('status-text').textContent = 'Stopped';
+    \\}
+    \\update(); setInterval(update, 2000);
+    \\</script>
+    \\</body>
+    \\</html>
+;
 
 // ── Tests ──
 

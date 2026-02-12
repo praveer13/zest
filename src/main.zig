@@ -427,7 +427,33 @@ fn autoStartServer(allocator: std.mem.Allocator, io: Io, init: std.process.Init,
         .stdin = .ignore,
     }) catch return;
 
-    stdout.print("Auto-started background server for seeding (BT :6881, HTTP :{d})\n", .{cfg.http_port}) catch {};
+    stdout.print("Seeding in background (BT :6881, HTTP :{d})\n", .{cfg.http_port}) catch {};
+    stdout.print("Dashboard: http://localhost:{d}\n", .{cfg.http_port}) catch {};
+    stdout.flush() catch {};
+
+    // Open dashboard in browser
+    openBrowser(io, cfg.http_port);
+}
+
+/// Open the dashboard in the user's browser.
+fn openBrowser(io: Io, http_port: u16) void {
+    var url_buf: [64]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://localhost:{d}", .{http_port}) catch return;
+
+    // Try xdg-open (Linux), then open (macOS)
+    _ = std.process.spawn(io, .{
+        .argv = &.{ "xdg-open", url },
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .stdin = .ignore,
+    }) catch {
+        _ = std.process.spawn(io, .{
+            .argv = &.{ "open", url },
+            .stdout = .ignore,
+            .stderr = .ignore,
+            .stdin = .ignore,
+        }) catch return;
+    };
 }
 
 /// Check if zest server is running by hitting the health endpoint.
