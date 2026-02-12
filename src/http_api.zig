@@ -104,6 +104,8 @@ pub const HttpApi = struct {
             try self.handleStop(http_server, request);
         } else if (std.mem.startsWith(u8, target, "/v1/pull")) {
             try self.handlePull(http_server, request);
+        } else if (std.mem.eql(u8, target, "/v1/models")) {
+            try self.handleModels(http_server, request);
         } else if (std.mem.eql(u8, target, "/") or std.mem.eql(u8, target, "/ui")) {
             try self.handleDashboard(http_server, request);
         } else {
@@ -146,6 +148,67 @@ pub const HttpApi = struct {
         if (self.bt_server) |bs| bs.shutdown();
     }
 
+    /// Scan HF cache for downloaded models and return as JSON array.
+    fn handleModels(self: *HttpApi, http_server: *std.http.Server, request: std.http.Server.Request) !void {
+        var json: std.ArrayList(u8) = .empty;
+        defer json.deinit(self.allocator);
+        try json.append(self.allocator, '[');
+
+        scan: {
+            var hub_dir = Io.Dir.openDirAbsolute(self.io, self.cfg.hf_cache_dir, .{ .iterate = true }) catch break :scan;
+            defer hub_dir.close(self.io);
+
+            var it = hub_dir.iterate();
+            var first: bool = true;
+            while (it.next(self.io) catch null) |entry| {
+                if (entry.kind != .directory) continue;
+                const prefix = "models--";
+                if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+                const raw = entry.name[prefix.len..];
+                if (raw.len == 0) continue;
+
+                // Count files in latest snapshot
+                var file_count: usize = 0;
+                count: {
+                    var model_dir = hub_dir.openDir(self.io, entry.name, .{ .iterate = true }) catch break :count;
+                    defer model_dir.close(self.io);
+                    var snap_dir = model_dir.openDir(self.io, "snapshots", .{ .iterate = true }) catch break :count;
+                    defer snap_dir.close(self.io);
+                    var snap_it = snap_dir.iterate();
+                    const snap_entry = snap_it.next(self.io) catch null orelse break :count;
+                    if (snap_entry.kind != .directory) break :count;
+                    var file_dir = snap_dir.openDir(self.io, snap_entry.name, .{ .iterate = true }) catch break :count;
+                    defer file_dir.close(self.io);
+                    var file_it = file_dir.iterate();
+                    while (file_it.next(self.io) catch null) |_| {
+                        file_count += 1;
+                    }
+                }
+
+                if (!first) try json.append(self.allocator, ',');
+                first = false;
+
+                try json.appendSlice(self.allocator, "{\"name\":\"");
+                // Convert first -- back to / (models--org--name → org/name)
+                if (std.mem.indexOf(u8, raw, "--")) |sep| {
+                    try json.appendSlice(self.allocator, raw[0..sep]);
+                    try json.append(self.allocator, '/');
+                    try json.appendSlice(self.allocator, raw[sep + 2..]);
+                } else {
+                    try json.appendSlice(self.allocator, raw);
+                }
+                try json.appendSlice(self.allocator, "\",\"files\":");
+                var buf: [20]u8 = undefined;
+                const count_str = std.fmt.bufPrint(&buf, "{d}", .{file_count}) catch "0";
+                try json.appendSlice(self.allocator, count_str);
+                try json.append(self.allocator, '}');
+            }
+        }
+
+        try json.append(self.allocator, ']');
+        try self.sendJson(http_server, request, .ok, json.items);
+    }
+
     fn handleDashboard(_: *HttpApi, _: *std.http.Server, request: std.http.Server.Request) !void {
         var req = request;
         try req.respond(dashboard_html, .{
@@ -171,98 +234,120 @@ pub const HttpApi = struct {
 
 const dashboard_html =
     \\<!DOCTYPE html>
-    \\<html lang="en">
-    \\<head>
+    \\<html lang="en"><head>
     \\<meta charset="utf-8">
     \\<meta name="viewport" content="width=device-width, initial-scale=1">
-    \\<title>zest - P2P Seeding Status</title>
+    \\<title>zest</title>
     \\<style>
-    \\  * { margin: 0; padding: 0; box-sizing: border-box; }
-    \\  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-    \\    background: #0a0a0a; color: #e0e0e0; padding: 40px 20px; }
-    \\  .container { max-width: 640px; margin: 0 auto; }
-    \\  h1 { font-size: 24px; margin-bottom: 8px; color: #fff; }
-    \\  h1 span { color: #4ade80; }
-    \\  .subtitle { color: #888; margin-bottom: 32px; font-size: 14px; }
-    \\  .card { background: #161616; border: 1px solid #2a2a2a; border-radius: 12px;
-    \\    padding: 24px; margin-bottom: 16px; }
-    \\  .card h2 { font-size: 14px; color: #888; text-transform: uppercase;
-    \\    letter-spacing: 0.5px; margin-bottom: 16px; }
-    \\  .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-    \\  .stat { }
-    \\  .stat .value { font-size: 32px; font-weight: 700; color: #fff; }
-    \\  .stat .label { font-size: 13px; color: #888; margin-top: 2px; }
-    \\  .stat .value.green { color: #4ade80; }
-    \\  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-    \\    margin-right: 8px; vertical-align: middle; }
-    \\  .dot.on { background: #4ade80; box-shadow: 0 0 8px #4ade8066; }
-    \\  .dot.off { background: #666; }
-    \\  .status-line { font-size: 14px; color: #aaa; margin-bottom: 24px; }
-    \\  .footer { text-align: center; color: #555; font-size: 12px; margin-top: 32px; }
-    \\  .footer a { color: #888; }
-    \\  .stop-btn { background: #2a2a2a; color: #e0e0e0; border: 1px solid #444;
-    \\    padding: 8px 20px; border-radius: 8px; cursor: pointer; font-size: 13px;
-    \\    float: right; margin-top: -4px; }
-    \\  .stop-btn:hover { background: #dc2626; color: #fff; border-color: #dc2626; }
-    \\</style>
-    \\</head>
+    \\*{margin:0;padding:0;box-sizing:border-box}
+    \\body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#09090b;color:#fafafa;min-height:100vh}
+    \\.container{max-width:680px;margin:0 auto;padding:48px 20px}
+    \\.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:36px}
+    \\.logo{display:flex;align-items:center;gap:10px}
+    \\.logo-mark{width:32px;height:32px;background:linear-gradient(135deg,#22c55e 0%,#3b82f6 100%);
+    \\  border-radius:8px;display:flex;align-items:center;justify-content:center;
+    \\  font-weight:800;font-size:16px;color:#000}
+    \\.logo h1{font-size:20px;font-weight:700;letter-spacing:-0.03em}
+    \\.badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:500;
+    \\  padding:5px 12px;border-radius:99px}
+    \\.badge.on{background:#052e16;border:1px solid #166534;color:#4ade80}
+    \\.badge.off{background:#1c1917;border:1px solid #44403c;color:#a8a29e}
+    \\.pulse{width:7px;height:7px;border-radius:50%;background:currentColor}
+    \\.badge.on .pulse{animation:pulse 2s infinite}
+    \\@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(74,222,128,.4)}50%{box-shadow:0 0 0 6px rgba(74,222,128,0)}}
+    \\.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:28px}
+    \\.stat{background:#18181b;border:1px solid #27272a;border-radius:10px;padding:14px 16px}
+    \\.stat .v{font-size:26px;font-weight:700;line-height:1.2;font-variant-numeric:tabular-nums}
+    \\.stat .v.green{color:#4ade80}
+    \\.stat .l{font-size:10px;color:#71717a;text-transform:uppercase;letter-spacing:.06em;margin-top:3px}
+    \\.sec{font-size:11px;color:#52525b;text-transform:uppercase;letter-spacing:.08em;
+    \\  font-weight:600;margin-bottom:10px}
+    \\.models{background:#18181b;border:1px solid #27272a;border-radius:10px;overflow:hidden;margin-bottom:28px}
+    \\.model{padding:14px 16px;border-bottom:1px solid #27272a;display:flex;
+    \\  align-items:center;justify-content:space-between;transition:background .1s}
+    \\.model:last-child{border-bottom:none}
+    \\.model:hover{background:#1f1f23}
+    \\.m-left{display:flex;align-items:center;gap:12px;min-width:0}
+    \\.m-icon{width:34px;height:34px;background:#27272a;border-radius:8px;display:flex;
+    \\  align-items:center;justify-content:center;font-size:18px;flex-shrink:0}
+    \\.m-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    \\.m-org{color:#a1a1aa;font-weight:400}
+    \\.m-meta{font-size:11px;color:#52525b;margin-top:2px}
+    \\.m-status{font-size:11px;color:#4ade80;display:flex;align-items:center;gap:5px;flex-shrink:0}
+    \\.m-dot{width:5px;height:5px;border-radius:50%;background:#4ade80}
+    \\.empty{padding:40px 16px;text-align:center;color:#52525b;font-size:13px}
+    \\.empty code{background:#27272a;padding:2px 6px;border-radius:4px;font-size:12px}
+    \\.footer{display:flex;justify-content:space-between;align-items:center;
+    \\  padding-top:20px;border-top:1px solid #27272a;font-size:11px;color:#52525b}
+    \\.footer a{color:#71717a;text-decoration:none}.footer a:hover{color:#a1a1aa}
+    \\.stop{background:none;color:#52525b;border:1px solid #27272a;padding:5px 12px;
+    \\  border-radius:6px;cursor:pointer;font-size:11px;transition:all .15s}
+    \\.stop:hover{background:#450a0a;color:#fca5a5;border-color:#7f1d1d}
+    \\@media(max-width:520px){.stats{grid-template-columns:repeat(2,1fr)}}
+    \\</style></head>
     \\<body>
     \\<div class="container">
-    \\  <h1><span>zest</span> seeding status</h1>
-    \\  <div class="status-line"><span class="dot on" id="dot"></span><span id="status-text">Seeding</span>
-    \\    <button class="stop-btn" onclick="stopServer()">Stop Server</button></div>
-    \\  <div class="card">
-    \\    <h2>Network</h2>
-    \\    <div class="stat-grid">
-    \\      <div class="stat"><div class="value green" id="peers">0</div><div class="label">Connected peers</div></div>
-    \\      <div class="stat"><div class="value" id="chunks">0</div><div class="label">Chunks served</div></div>
+    \\  <div class="header">
+    \\    <div class="logo">
+    \\      <div class="logo-mark">Z</div>
+    \\      <h1>zest</h1>
+    \\    </div>
+    \\    <div class="badge on" id="badge">
+    \\      <div class="pulse"></div>
+    \\      <span id="status">Seeding</span>
     \\    </div>
     \\  </div>
-    \\  <div class="card">
-    \\    <h2>Cache</h2>
-    \\    <div class="stat-grid">
-    \\      <div class="stat"><div class="value" id="xorbs">0</div><div class="label">Xorbs cached</div></div>
-    \\      <div class="stat"><div class="value" id="requests">0</div><div class="label">HTTP requests</div></div>
-    \\    </div>
+    \\  <div class="stats">
+    \\    <div class="stat"><div class="v green" id="peers">0</div><div class="l">Peers</div></div>
+    \\    <div class="stat"><div class="v" id="chunks">0</div><div class="l">Served</div></div>
+    \\    <div class="stat"><div class="v" id="xorbs">0</div><div class="l">Xorbs</div></div>
+    \\    <div class="stat"><div class="v" id="uptime">0s</div><div class="l">Uptime</div></div>
     \\  </div>
-    \\  <div class="card">
-    \\    <h2>Server</h2>
-    \\    <div class="stat-grid">
-    \\      <div class="stat"><div class="value" id="bt-port" style="font-size:20px">-</div><div class="label">BT port</div></div>
-    \\      <div class="stat"><div class="value" id="http-port" style="font-size:20px">-</div><div class="label">HTTP port</div></div>
-    \\    </div>
+    \\  <div class="sec">Models being seeded</div>
+    \\  <div class="models" id="models">
+    \\    <div class="empty">Loading...</div>
     \\  </div>
-    \\  <div class="footer">zest &mdash; P2P acceleration for ML model distribution &mdash;
-    \\    <a href="https://github.com/praveer13/zest">GitHub</a></div>
+    \\  <div class="footer">
+    \\    <div>BT <span id="bt-port">:6881</span> &middot; HTTP <span id="http-port">:9847</span>
+    \\      &middot; <a href="https://github.com/praveer13/zest">GitHub</a></div>
+    \\    <button class="stop" onclick="stopZest()">Stop server</button>
+    \\  </div>
     \\</div>
     \\<script>
-    \\async function update() {
-    \\  try {
-    \\    const r = await fetch('/v1/status');
-    \\    const d = await r.json();
-    \\    document.getElementById('peers').textContent = d.bt_peers;
-    \\    document.getElementById('chunks').textContent = d.chunks_served;
-    \\    document.getElementById('xorbs').textContent = d.xorbs_cached;
-    \\    document.getElementById('requests').textContent = d.http_requests;
-    \\    document.getElementById('bt-port').textContent = ':' + d.bt_port;
-    \\    document.getElementById('http-port').textContent = ':' + d.http_port;
-    \\    document.getElementById('dot').className = 'dot on';
-    \\    document.getElementById('status-text').textContent = 'Seeding';
-    \\  } catch(e) {
-    \\    document.getElementById('dot').className = 'dot off';
-    \\    document.getElementById('status-text').textContent = 'Offline';
-    \\  }
-    \\}
-    \\async function stopServer() {
-    \\  if (!confirm('Stop the zest seeding server?')) return;
-    \\  try { await fetch('/v1/stop', {method:'POST'}); } catch(e) {}
-    \\  document.getElementById('dot').className = 'dot off';
-    \\  document.getElementById('status-text').textContent = 'Stopped';
-    \\}
-    \\update(); setInterval(update, 2000);
+    \\var t0=Date.now();
+    \\function fmtTime(ms){var s=ms/1000|0;if(s<60)return s+'s';var m=s/60|0;
+    \\  if(m<60)return m+'m '+s%60+'s';var h=m/60|0;return h+'h '+m%60+'m'}
+    \\function renderModels(ms){var el=document.getElementById('models');
+    \\  if(!ms||!ms.length){el.innerHTML='<div class="empty">No models yet.<br>Run <code>zest pull &lt;repo&gt;</code> to get started.</div>';return}
+    \\  el.innerHTML=ms.map(function(m){var p=m.name.split('/'),
+    \\    org=p.length>1?'<span class="m-org">'+p[0]+'/</span>':'',
+    \\    name=p.length>1?p[1]:p[0];
+    \\    return '<div class="model"><div class="m-left">'
+    \\    +'<div class="m-icon">&#x1F917;</div>'
+    \\    +'<div><div class="m-name">'+org+name+'</div>'
+    \\    +'<div class="m-meta">'+m.files+' files</div></div></div>'
+    \\    +'<div class="m-status"><div class="m-dot"></div>Seeding</div></div>'}).join('')}
+    \\async function update(){try{
+    \\  var r=await Promise.all([fetch('/v1/status'),fetch('/v1/models')]);
+    \\  var d=await r[0].json(),ms=await r[1].json();
+    \\  document.getElementById('peers').textContent=d.bt_peers;
+    \\  document.getElementById('chunks').textContent=d.chunks_served.toLocaleString();
+    \\  document.getElementById('xorbs').textContent=d.xorbs_cached;
+    \\  document.getElementById('uptime').textContent=fmtTime(Date.now()-t0);
+    \\  document.getElementById('bt-port').textContent=':'+d.bt_port;
+    \\  document.getElementById('http-port').textContent=':'+d.http_port;
+    \\  document.getElementById('badge').className='badge on';
+    \\  document.getElementById('status').textContent='Seeding';
+    \\  renderModels(ms);
+    \\}catch(e){document.getElementById('badge').className='badge off';
+    \\  document.getElementById('status').textContent='Offline'}}
+    \\async function stopZest(){if(!confirm('Stop seeding?'))return;
+    \\  try{await fetch('/v1/stop',{method:'POST'})}catch(e){}
+    \\  document.getElementById('badge').className='badge off';
+    \\  document.getElementById('status').textContent='Stopped'}
+    \\update();setInterval(update,2000);
     \\</script>
-    \\</body>
-    \\</html>
+    \\</body></html>
 ;
 
 // ── Tests ──
