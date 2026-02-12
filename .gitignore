@@ -2,6 +2,14 @@
 zig-out/
 zig-pkg/
 
+# Nix / direnv
+.direnv/
+.envrc
+
+# Python bytecode
+__pycache__/
+*.pyc
+
 # Python build artifacts
 python/dist/
 python/build/
