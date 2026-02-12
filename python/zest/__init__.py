@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 
-__version__ = "0.3.3"
+__version__ = "0.3.5"
 
 _server = None
 _client = None
