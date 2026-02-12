@@ -193,7 +193,7 @@ pub const HttpApi = struct {
                 if (std.mem.indexOf(u8, raw, "--")) |sep| {
                     try json.appendSlice(self.allocator, raw[0..sep]);
                     try json.append(self.allocator, '/');
-                    try json.appendSlice(self.allocator, raw[sep + 2..]);
+                    try json.appendSlice(self.allocator, raw[sep + 2 ..]);
                 } else {
                     try json.appendSlice(self.allocator, raw);
                 }
