@@ -17,6 +17,9 @@ python/*.egg-info
 python/zest/*.egg-info
 python/zest_transfer.egg-info/
 
+# Test infrastructure state (SSH keys, node IPs)
+test/hetzner/.state/
+
 # Bundled binary (built per-platform, not committed)
 python/zest/_bin/zest
 !python/zest/_bin/.gitkeep

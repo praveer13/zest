@@ -57,25 +57,38 @@ zest/
 ├── DESIGN.md              Full design document
 ├── CLAUDE.md              ← this file
 ├── README.md
+├── scripts/
+│   └── build-wheel.sh     Build Zig binary + Python wheel
+├── python/
+│   ├── pyproject.toml      Python package metadata (zest-transfer)
+│   └── zest/               Python API: enable(), pull(), status(), stop()
+├── test/
+│   └── hetzner/
+│       └── p2p-test.sh     3-node Hetzner Cloud P2P integration test
 ├── .github/workflows/
 │   └── ci.yml             CI: build, test, lint, benchmark, metrics
 └── src/
-    ├── main.zig           CLI: pull, seed, bench, version, help (399 lines)
-    ├── root.zig           Library re-exports (31 lines)
-    ├── config.zig         Config, HF token, DHT/peer settings (161 lines)
+    ├── main.zig           CLI: pull, seed, serve, start, stop, bench (805 lines)
+    ├── root.zig           Library re-exports (36 lines)
+    ├── config.zig         Config, HF token, DHT/peer settings (183 lines)
     ├── bencode.zig        Bencode encoder/decoder (368 lines, 12 tests)
     ├── peer_id.zig        BT peer ID + SHA-1 info_hash (63 lines, 5 tests)
     ├── bt_wire.zig        BT wire protocol, BEP 3+10 (274 lines, 8 tests)
     ├── bep_xet.zig        BEP XET extension messages (349 lines, 6 tests)
-    ├── bt_peer.zig        BT peer lifecycle + state machine (274 lines, 3 tests)
+    ├── bt_peer.zig        BT peer lifecycle + state machine (322 lines, 3 tests)
+    ├── peer_pool.zig      Connection pool for BT peer reuse (132 lines, 2 tests)
     ├── dht.zig            Kademlia DHT, BEP 5 (671 lines, 11 tests)
     ├── bt_tracker.zig     BT HTTP tracker client (260 lines, 5 tests)
-    ├── swarm.zig          Download orchestrator (334 lines)
-    ├── storage.zig        File I/O, xorb/chunk cache (175 lines)
+    ├── xet_bridge.zig     Bridges zig-xet CAS with P2P swarm (304 lines, 2 tests)
+    ├── parallel_download.zig  Concurrent xorb fetching (226 lines, 2 tests)
+    ├── swarm.zig          Download orchestrator (386 lines)
+    ├── storage.zig        File I/O, xorb/chunk cache (228 lines)
+    ├── server.zig         BT TCP listener + concurrent peers (255 lines, 3 tests)
+    ├── http_api.zig       HTTP REST API for Python integration (375 lines)
     └── bench.zig          Synthetic benchmarks + JSON (311 lines, 2 tests)
 ```
 
-**13 source files, ~3,670 lines, 58 tests.**
+**18 source files, ~5,548 lines, 72 tests.**
 
 ## BEP XET Protocol
 
@@ -87,7 +100,7 @@ zest is compliant with the [BEP XET specification](https://ccbittorrent.readthed
 - **CHUNK_NOT_FOUND** (0x03): 37 bytes — [type][request_id BE][chunk_hash]
 - **CHUNK_ERROR** (0x04): 9+N bytes — [type][request_id BE][error_code BE][message]
 - **info_hash**: `SHA-1("zest-xet-v1:" || xorb_hash_32bytes)` — per-xorb swarm granularity
-- **Peer ID**: Azureus-style `-ZE0300-` + 12 random bytes
+- **Peer ID**: Azureus-style `-ZE0400-` + 12 random bytes
 - **Chunk size**: 64KB target (matches HF Xet, not BEP XET default 16KB)
 - **Hash algorithm**: BLAKE3-256 for chunk verification
 

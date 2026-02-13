@@ -10,6 +10,7 @@ pub const default_listen_port: u16 = 6881;
 pub const default_http_port: u16 = 9847;
 pub const default_max_peers: u16 = 50;
 pub const default_chunk_target_size: u32 = 65536; // 64KB — matches HF Xet CDC chunk size
+pub const default_max_concurrent_downloads: u32 = 16;
 
 /// Well-known BT DHT bootstrap nodes.
 pub const dht_bootstrap_nodes = [_]struct { host: []const u8, port: u16 }{

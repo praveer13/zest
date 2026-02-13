@@ -3,9 +3,9 @@
 **P2P acceleration for ML model distribution.**
 
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
-[![Tests](https://img.shields.io/badge/tests-65%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-72%20passing-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
-[![Lines of Code](https://img.shields.io/badge/lines-4%2C563-informational)](#project-structure)
+[![Lines of Code](https://img.shields.io/badge/lines-5%2C548-informational)](#project-structure)
 
 zest speaks HuggingFace's [Xet protocol](https://huggingface.co/docs/xet/index) (via [zig-xet](https://github.com/jedisct1/zig-xet)) for content addressing and [BitTorrent](https://www.bittorrent.org/beps/bep_0003.html) (BEP 3 / BEP 10 / [BEP XET](https://ccbittorrent.readthedocs.io/en/latest/bep_xet/)) for peer-to-peer transfer. Models download from nearby peers first, fall back to HF's CDN.
 
@@ -290,11 +290,16 @@ zest/
     ├── peer_pool.zig      Connection pool for BT peer reuse
     ├── dht.zig            Kademlia DHT (BEP 5) for peer discovery
     ├── bt_tracker.zig     Standard BT HTTP tracker client
+    ├── xet_bridge.zig     Bridges zig-xet CAS with P2P swarm (cache→P2P→CDN waterfall)
+    ├── parallel_download.zig  Concurrent xorb fetching via Io.Group (up to 16 parallel)
     ├── swarm.zig          Download orchestrator (cache→peers→CDN)
     ├── storage.zig        File I/O, HF cache refs, xorb/chunk cache, XorbRegistry
-    ├── server.zig         BT TCP listener for seeding chunks
+    ├── server.zig         BT TCP listener for seeding chunks (concurrent via Io.Group)
     ├── http_api.zig       HTTP REST API for Python integration
     └── bench.zig          Synthetic benchmarks with JSON output
+├── test/
+│   └── hetzner/
+│       └── p2p-test.sh    3-node Hetzner Cloud P2P integration test
 ```
 
 ## Performance
@@ -314,7 +319,7 @@ Run benchmarks: `zest bench --synthetic` or `zest bench --synthetic --json` for 
 ## Testing
 
 ```bash
-# run all tests (65 tests across 16 modules)
+# run all tests (72 tests across 18 modules)
 zig build test --summary all
 
 # check formatting
@@ -354,7 +359,8 @@ zig build test --summary all
 - [x] **Phase 2: Server Mode** — BT TCP listener, HTTP REST API, serve/start/stop commands
 - [x] **Phase 3: Transfer Optimizations** — connection pooling, request pipelining, seed-while-downloading
 - [x] **Phase 4: Python Package** — `pip install zest`, HF backend hook, auto-enable via `ZEST=1`
-- [ ] **Phase 5: Ecosystem** — vLLM, Ollama, llama.cpp integrations
+- [x] **Phase 5: XET Bridge + Parallel Downloads** — xorb-level cache→P2P→CDN waterfall, 16x concurrent downloads, thread-safe peer pool
+- [ ] **Phase 6: Ecosystem** — vLLM, Ollama, llama.cpp integrations
 
 See [DESIGN.md](DESIGN.md) for the full design document with architecture, BEP XET compliance details, and UX plans.
 

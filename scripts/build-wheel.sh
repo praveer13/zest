@@ -17,7 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 PYTHON_DIR="$ROOT_DIR/python"
 BIN_DIR="$PYTHON_DIR/zest/_bin"
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 build_wheel() {
     local TARGET="$1"

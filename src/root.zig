@@ -27,6 +27,8 @@ pub const peer_pool = @import("peer_pool.zig");
 pub const bench = @import("bench.zig");
 pub const server = @import("server.zig");
 pub const http_api = @import("http_api.zig");
+pub const xet_bridge = @import("xet_bridge.zig");
+pub const parallel_download = @import("parallel_download.zig");
 
 test {
     // Run tests from all modules

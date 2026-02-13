@@ -11,6 +11,7 @@ const Io = std.Io;
 const net = Io.net;
 const config = @import("config.zig");
 const storage = @import("storage.zig");
+const swarm_mod = @import("swarm.zig");
 const bt_wire = @import("bt_wire.zig");
 const bep_xet = @import("bep_xet.zig");
 const peer_id_mod = @import("peer_id.zig");
@@ -19,6 +20,7 @@ pub const BtServer = struct {
     allocator: std.mem.Allocator,
     io: Io,
     cfg: *const config.Config,
+    xorb_cache: swarm_mod.XorbCache,
     listener: ?net.Server,
     shutdown_flag: std.atomic.Value(bool),
     active_peers: std.atomic.Value(u32),
@@ -29,6 +31,7 @@ pub const BtServer = struct {
             .allocator = allocator,
             .io = io,
             .cfg = cfg,
+            .xorb_cache = swarm_mod.XorbCache.init(allocator, io, cfg),
             .listener = null,
             .shutdown_flag = std.atomic.Value(bool).init(false),
             .active_peers = std.atomic.Value(u32).init(0),
@@ -37,6 +40,7 @@ pub const BtServer = struct {
     }
 
     /// Start listening and accepting connections. Blocks until shutdown.
+    /// Handles multiple peers concurrently via Io.Group.
     pub fn run(self: *BtServer) !void {
         const addr: net.IpAddress = .{ .ip4 = .unspecified(self.cfg.listen_port) };
         var listener = try addr.listen(self.io, .{
@@ -48,17 +52,30 @@ pub const BtServer = struct {
             self.listener = null;
         }
 
+        var group: Io.Group = Io.Group.init;
+
         while (!self.shutdown_flag.load(.acquire)) {
-            const stream = listener.accept(self.io) catch |err| {
+            const stream = listener.accept(self.io) catch {
                 if (self.shutdown_flag.load(.acquire)) break;
-                // Log and continue on transient errors
-                _ = err;
                 continue;
             };
 
-            // Handle peer connection (inline for now, async with Io.Group later)
-            self.handlePeerConnection(stream);
+            const ctx = self.allocator.create(PeerContext) catch {
+                stream.close(self.io);
+                continue;
+            };
+            ctx.* = .{ .server = self, .stream = stream };
+
+            // Spawn peer handler concurrently
+            group.concurrent(self.io, handlePeerConcurrent, .{ctx}) catch |err| {
+                switch (err) {
+                    error.ConcurrencyUnavailable => handlePeerConcurrent(ctx),
+                }
+            };
         }
+
+        // Wait for all active peer handlers to finish
+        group.await(self.io) catch {};
     }
 
     /// Signal the server to stop accepting new connections.
@@ -69,6 +86,18 @@ pub const BtServer = struct {
             l.deinit(self.io);
             self.listener = null;
         }
+    }
+
+    /// Context for a concurrent peer handler task.
+    const PeerContext = struct {
+        server: *BtServer,
+        stream: net.Stream,
+    };
+
+    /// Entry point for concurrent peer handling via Io.Group.
+    fn handlePeerConcurrent(ctx: *PeerContext) void {
+        ctx.server.handlePeerConnection(ctx.stream);
+        ctx.server.allocator.destroy(ctx);
     }
 
     /// Handle a single incoming BT peer connection.
@@ -155,22 +184,29 @@ pub const BtServer = struct {
     }
 
     fn handleChunkRequest(self: *BtServer, writer: *Io.Writer, request_id: u32, chunk_hash: [32]u8) !void {
-        // Look up chunk in local cache
+        // Look up in chunk cache first
         const data = try storage.readChunk(self.allocator, self.io, self.cfg, chunk_hash);
         if (data) |chunk_data| {
             defer self.allocator.free(chunk_data);
-
-            // Send CHUNK_RESPONSE
-            // Use ext_id=1 (our ut_xet ID from handshake)
             try bep_xet.encodeChunkResponse(writer, 1, request_id, chunk_data);
             try writer.flush();
-
             _ = self.chunks_served.fetchAdd(1, .monotonic);
-        } else {
-            // Send CHUNK_NOT_FOUND
-            try bep_xet.encodeChunkNotFound(writer, 1, request_id, chunk_hash);
-            try writer.flush();
+            return;
         }
+
+        // Fall back to xorb cache (P2P requests xorbs by hash)
+        const hex = storage.hashToHex(chunk_hash);
+        if (try self.xorb_cache.get(&hex)) |xorb_data| {
+            defer self.allocator.free(xorb_data);
+            try bep_xet.encodeChunkResponse(writer, 1, request_id, xorb_data);
+            try writer.flush();
+            _ = self.chunks_served.fetchAdd(1, .monotonic);
+            return;
+        }
+
+        // Not found anywhere
+        try bep_xet.encodeChunkNotFound(writer, 1, request_id, chunk_hash);
+        try writer.flush();
     }
 
     pub fn getStats(self: *const BtServer) ServerStats {

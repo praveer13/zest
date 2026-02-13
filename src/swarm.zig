@@ -139,6 +139,9 @@ pub const SwarmDownloader = struct {
     xorb_registry: ?*storage.XorbRegistry,
     // Direct peers specified via --peer flag (tried before DHT/tracker)
     direct_peers: std.ArrayList(net.IpAddress),
+    // Mutex to serialize P2P access from parallel downloader's concurrent tasks.
+    // Prevents concurrent access to peer_pool and BtPeer TCP streams.
+    p2p_mutex: Io.Mutex,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -179,6 +182,7 @@ pub const SwarmDownloader = struct {
             .peer_pool = peer_pool_mod.PeerPool.init(allocator, io, cfg_ptr.peer_id, cfg_ptr.listen_port, cfg_ptr.max_peers),
             .xorb_registry = null,
             .direct_peers = .empty,
+            .p2p_mutex = Io.Mutex.init,
         };
     }
 
@@ -240,7 +244,12 @@ pub const SwarmDownloader = struct {
 
     /// Try to download a xorb via BT peers (DHT + tracker discovery).
     /// Uses connection pool to reuse existing connections.
-    fn tryBtPeerDownload(self: *SwarmDownloader, term: *const Term) bool {
+    /// Returns true if the xorb was downloaded and cached successfully.
+    /// Thread-safe: serialized via p2p_mutex to protect peer_pool and BtPeer streams.
+    pub fn tryBtPeerDownload(self: *SwarmDownloader, term: *const Term) bool {
+        self.p2p_mutex.lockUncancelable(self.io);
+        defer self.p2p_mutex.unlock(self.io);
+
         const info_hash = peer_id_mod.computeInfoHash(term.xorb_hash);
 
         // Collect peer addresses from all discovery sources
@@ -300,7 +309,7 @@ pub const SwarmDownloader = struct {
         const data = peer.requestChunk(term.xorb_hash) catch |err| {
             // Connection error — remove from pool so next attempt reconnects
             switch (err) {
-                error.ChunkNotFound, error.ChunkError, error.ChunkHashMismatch => {},
+                error.ChunkNotFound, error.ChunkError => {},
                 else => self.peer_pool.remove(address),
             }
             return false;

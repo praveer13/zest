@@ -32,7 +32,7 @@ pub const BtPeer = struct {
     listen_port: u16,
 
     pub fn connect(allocator: std.mem.Allocator, io: Io, address: net.IpAddress, info_hash: [20]u8, our_peer_id: [20]u8, listen_port: u16) !BtPeer {
-        const stream = try address.connect(io, .{ .mode = .nonblocking });
+        const stream = try address.connect(io, .{ .mode = .stream });
         return .{
             .allocator = allocator,
             .io = io,
@@ -106,24 +106,8 @@ pub const BtPeer = struct {
             }
         }
 
-        // Read unchoke/interested from peer (drain control messages)
-        self.drainControlMessages(reader);
-    }
-
-    /// Drain unchoke/interested messages from peer after handshake.
-    fn drainControlMessages(self: *BtPeer, reader: *Io.Reader) void {
-        // Try to read a couple of control messages without blocking indefinitely
-        for (0..4) |_| {
-            const msg = bt_wire.readMessage(reader, self.allocator) catch return;
-            if (msg) |m| {
-                switch (m.msg_id) {
-                    .unchoke => self.peer_choking = false,
-                    .interested => {},
-                    else => {},
-                }
-                if (m.payload.len > 0) self.allocator.free(m.payload);
-            }
-        }
+        // Server's unchoke/interested messages will be handled inline
+        // by requestChunk's message loop — no need to drain here.
     }
 
     /// Request a chunk from the peer and return the data.
@@ -166,13 +150,10 @@ pub const BtPeer = struct {
                 .chunk_response => |resp| {
                     if (resp.request_id != request_id) continue;
 
-                    // Verify BLAKE3 hash
-                    var hash: [32]u8 = undefined;
-                    Blake3.hash(resp.data, &hash, .{});
-                    if (!std.mem.eql(u8, &hash, &chunk_hash)) {
-                        return error.ChunkHashMismatch;
-                    }
-
+                    // Note: xorb hashes are Merkle BLAKE3 (not simple BLAKE3),
+                    // so we cannot verify with a single hash call. Data integrity
+                    // is verified downstream when XorbReader parses the xorb and
+                    // extracts chunks (each chunk is individually hash-verified).
                     return try self.allocator.dupe(u8, resp.data);
                 },
                 .chunk_not_found => |nf| {

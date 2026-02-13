@@ -25,8 +25,10 @@ const dht_mod = @import("dht.zig");
 const bench_mod = @import("bench.zig");
 const server_mod = @import("server.zig");
 const http_api_mod = @import("http_api.zig");
+const xet_bridge_mod = @import("xet_bridge.zig");
+const parallel_dl = @import("parallel_download.zig");
 
-const version = "0.3.0";
+const version = "0.4.0";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -184,7 +186,30 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
         try stdout.print("  Direct peer: {s}\n", .{peer_str});
     }
 
-    // Step 4: Download and reconstruct each file
+    // Step 4: Initialize XET bridge (cache → P2P → CDN pipeline)
+    var bridge = xet_bridge_mod.XetBridge.init(allocator, io, &cfg, &downloader);
+    defer bridge.deinit();
+
+    // Authenticate with HF to get Xet token (needed for CAS queries)
+    if (xet_count > 0) {
+        if (cfg.hf_token) |hf_token| {
+            try stdout.print("Authenticating with Xet CAS...\n", .{});
+            try stdout.flush();
+            bridge.authenticate(repo_id, "model", revision, hf_token) catch |err| {
+                try stderr.print("Warning: Xet auth failed ({}), falling back to direct download\n", .{err});
+            };
+        }
+    }
+
+    // Initialize parallel downloader (uses Io.Group for concurrent xorb fetches)
+    var par_dl = parallel_dl.ParallelDownloader.init(
+        allocator,
+        io,
+        &bridge,
+        config.default_max_concurrent_downloads,
+    );
+
+    // Step 5: Download and reconstruct each file
     var files_done: usize = 0;
     for (file_list.files) |file| {
         files_done += 1;
@@ -203,26 +228,52 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
             try stdout.print(" [xet]\n", .{});
             try stdout.flush();
 
-            // Use zig-xet to download the file via Xet protocol.
-            try ensureParentDirs(io, output_path);
-
-            const dl_config = xet.model_download.DownloadConfig{
-                .repo_id = repo_id,
-                .revision = revision,
-                .file_hash_hex = xet_hash_hex,
-                .hf_token = cfg.hf_token,
-            };
-
-            xet.model_download.downloadModelToFile(
-                allocator,
-                io,
-                environ,
-                dl_config,
-                output_path,
-            ) catch |err| {
-                try stderr.print("  Error downloading via xet: {}\n", .{err});
-                continue;
-            };
+            // Try parallel pipeline first: cache → CDN (16 concurrent xorb fetches)
+            if (bridge.cas != null) {
+                par_dl.reconstructToFile(xet_hash_hex, output_path) catch |err| {
+                    try stderr.print("  Parallel download error ({}), falling back to sequential\n", .{err});
+                    // Fall back to sequential bridge pipeline
+                    bridge.reconstructToFile(xet_hash_hex, output_path) catch |err2| {
+                        try stderr.print("  Bridge error ({}), falling back to direct download\n", .{err2});
+                        try ensureParentDirs(io, output_path);
+                        const dl_config = xet.model_download.DownloadConfig{
+                            .repo_id = repo_id,
+                            .revision = revision,
+                            .file_hash_hex = xet_hash_hex,
+                            .hf_token = cfg.hf_token,
+                        };
+                        xet.model_download.downloadModelToFile(
+                            allocator,
+                            io,
+                            environ,
+                            dl_config,
+                            output_path,
+                        ) catch |err3| {
+                            try stderr.print("  Error downloading via xet: {}\n", .{err3});
+                            continue;
+                        };
+                    };
+                };
+            } else {
+                // No bridge auth — use zig-xet directly (CDN only)
+                try ensureParentDirs(io, output_path);
+                const dl_config = xet.model_download.DownloadConfig{
+                    .repo_id = repo_id,
+                    .revision = revision,
+                    .file_hash_hex = xet_hash_hex,
+                    .hf_token = cfg.hf_token,
+                };
+                xet.model_download.downloadModelToFile(
+                    allocator,
+                    io,
+                    environ,
+                    dl_config,
+                    output_path,
+                ) catch |err| {
+                    try stderr.print("  Error downloading via xet: {}\n", .{err});
+                    continue;
+                };
+            }
         } else {
             try stdout.print(" [regular]\n", .{});
             try stdout.flush();
@@ -243,6 +294,7 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
         autoStartServer(allocator, io, init, &cfg, stdout);
     }
 
+    bridge.printStats(stdout);
     downloader.printStats(stdout);
     try stdout.print("\nDone! Model available at:\n", .{});
 
@@ -339,6 +391,15 @@ fn cmdBench(allocator: std.mem.Allocator, io: Io, stdout: *Io.Writer, stderr: *I
     try bench_mod.runSyntheticWithIo(allocator, io, stdout, json_output);
 }
 
+/// Context for running BtServer as a concurrent Io.Group task.
+const BtServerCtx = struct {
+    server: *server_mod.BtServer,
+};
+
+fn runBtServerConcurrent(ctx: *BtServerCtx) void {
+    ctx.server.run() catch {};
+}
+
 fn cmdServe(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Writer, _: *Io.Writer, args: []const [:0]const u8) !void {
     const io = init.io;
     const environ = init.minimal.environ;
@@ -383,13 +444,24 @@ fn cmdServe(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wr
     // Start HTTP API
     var http_api = http_api_mod.HttpApi.init(allocator, io, &cfg, &bt_server, &shutdown_flag);
 
-    // Run BT server (blocks until shutdown)
-    // In the future, run BT and HTTP concurrently with Io.Group
-    // For now, run HTTP API (which handles /v1/stop to trigger shutdown)
-    _ = &bt_server;
+    // Run BT server concurrently with HTTP API via Io.Group
+    var bt_ctx = BtServerCtx{ .server = &bt_server };
+    var group: Io.Group = Io.Group.init;
+
+    group.concurrent(io, runBtServerConcurrent, .{&bt_ctx}) catch |err| {
+        switch (err) {
+            error.ConcurrencyUnavailable => {}, // HTTP-only fallback
+        }
+    };
+
+    // HTTP API blocks until /v1/stop
     http_api.run() catch |err| {
         try stdout.print("HTTP API error: {}\n", .{err});
     };
+
+    // Shutdown BT server after HTTP stops, wait for cleanup
+    bt_server.shutdown();
+    group.await(io) catch {};
 
     // Cleanup
     removePidFile(io, cfg.pid_file_path);
