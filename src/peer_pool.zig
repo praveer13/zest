@@ -17,6 +17,8 @@ pub const PeerPool = struct {
     max_peers: u16,
     /// Active connections keyed by serialized address bytes
     connections: std.AutoHashMap(AddressKey, *bt_peer_mod.BtPeer),
+    /// Protects hashmap lookup/insert only (held briefly).
+    mutex: Io.Mutex,
 
     const AddressKey = u64;
 
@@ -38,25 +40,26 @@ pub const PeerPool = struct {
             .listen_port = listen_port,
             .max_peers = max_peers,
             .connections = std.AutoHashMap(AddressKey, *bt_peer_mod.BtPeer).init(allocator),
+            .mutex = Io.Mutex.init,
         };
     }
 
     /// Get an existing connection or create a new one.
     /// The returned peer is ready for chunk requests.
+    /// Thread-safe: mutex protects hashmap only (held briefly).
+    /// Connect + handshake runs outside the lock.
     pub fn getOrConnect(self: *PeerPool, address: net.IpAddress, info_hash: [20]u8) !*bt_peer_mod.BtPeer {
         const key = addressToKey(address);
 
-        // Check for existing connection
+        // Fast path: existing connection (brief lock)
+        self.mutex.lockUncancelable(self.io);
         if (self.connections.get(key)) |peer| {
+            self.mutex.unlock(self.io);
             return peer;
         }
+        self.mutex.unlock(self.io);
 
-        // Evict if at capacity
-        if (self.connections.count() >= self.max_peers) {
-            self.evictOne();
-        }
-
-        // Create new connection
+        // Slow path: connect + handshake (no lock held)
         const peer = try self.allocator.create(bt_peer_mod.BtPeer);
         peer.* = try bt_peer_mod.BtPeer.connect(
             self.allocator,
@@ -70,14 +73,33 @@ pub const PeerPool = struct {
             peer.deinit();
             self.allocator.destroy(peer);
         }
-
         try peer.performHandshake();
+
+        // Re-check and insert (brief lock)
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.connections.get(key)) |existing| {
+            // Another task connected to the same peer; use theirs
+            peer.deinit();
+            self.allocator.destroy(peer);
+            return existing;
+        }
+
+        if (self.connections.count() >= self.max_peers) {
+            self.evictOne();
+        }
+
         try self.connections.put(key, peer);
         return peer;
     }
 
     /// Remove a specific peer from the pool (e.g., on error).
+    /// Thread-safe: acquires mutex for hashmap removal.
     pub fn remove(self: *PeerPool, address: net.IpAddress) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
         const key = addressToKey(address);
         if (self.connections.fetchRemove(key)) |kv| {
             kv.value.deinit();
