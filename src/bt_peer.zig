@@ -30,6 +30,9 @@ pub const BtPeer = struct {
     read_buf: [16384]u8,
     write_buf: [16384]u8,
     listen_port: u16,
+    /// Per-peer mutex: serializes access to this peer's TCP stream.
+    /// Two tasks hitting the same peer serialize here (correct — one TCP stream).
+    mutex: Io.Mutex,
 
     pub fn connect(allocator: std.mem.Allocator, io: Io, address: net.IpAddress, info_hash: [20]u8, our_peer_id: [20]u8, listen_port: u16) !BtPeer {
         const stream = try address.connect(io, .{ .mode = .stream });
@@ -48,6 +51,7 @@ pub const BtPeer = struct {
             .read_buf = undefined,
             .write_buf = undefined,
             .listen_port = listen_port,
+            .mutex = Io.Mutex.init,
         };
     }
 
@@ -112,7 +116,11 @@ pub const BtPeer = struct {
 
     /// Request a chunk from the peer and return the data.
     /// Verifies BLAKE3(data) == chunk_hash before returning.
+    /// Thread-safe: acquires per-peer mutex to serialize TCP stream access.
     pub fn requestChunk(self: *BtPeer, chunk_hash: [32]u8) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
         const ext_id = self.remote_xet_ext_id orelse return error.NoBepXetSupport;
 
         var sw = self.stream.writer(self.io, &self.write_buf);
