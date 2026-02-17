@@ -114,10 +114,15 @@ pub const BtPeer = struct {
         // by requestChunk's message loop — no need to drain here.
     }
 
-    /// Request a chunk from the peer and return the data.
-    /// Verifies BLAKE3(data) == chunk_hash before returning.
+    /// Result of a chunk fetch: raw data + chunk_offset for index rebasing.
+    pub const ChunkFetchResult = struct {
+        data: []u8,
+        chunk_offset: u32,
+    };
+
+    /// Request a chunk from the peer and return the data with chunk_offset.
     /// Thread-safe: acquires per-peer mutex to serialize TCP stream access.
-    pub fn requestChunk(self: *BtPeer, chunk_hash: [32]u8) ![]u8 {
+    pub fn requestChunk(self: *BtPeer, chunk_hash: [32]u8, range_start: u32, range_end: u32) !ChunkFetchResult {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
@@ -128,10 +133,10 @@ pub const BtPeer = struct {
         var sr = self.stream.reader(self.io, &self.read_buf);
         const reader = &sr.interface;
 
-        // Send CHUNK_REQUEST
+        // Send CHUNK_REQUEST with range
         const request_id = self.next_request_id;
         self.next_request_id += 1;
-        try bep_xet.encodeChunkRequest(writer, ext_id, request_id, chunk_hash);
+        try bep_xet.encodeChunkRequest(writer, ext_id, request_id, chunk_hash, range_start, range_end);
         try writer.flush();
 
         // Wait for response
@@ -162,7 +167,10 @@ pub const BtPeer = struct {
                     // so we cannot verify with a single hash call. Data integrity
                     // is verified downstream when XorbReader parses the xorb and
                     // extracts chunks (each chunk is individually hash-verified).
-                    return try self.allocator.dupe(u8, resp.data);
+                    return .{
+                        .data = try self.allocator.dupe(u8, resp.data),
+                        .chunk_offset = resp.chunk_offset,
+                    };
                 },
                 .chunk_not_found => |nf| {
                     if (nf.request_id == request_id) return error.ChunkNotFound;
@@ -177,7 +185,7 @@ pub const BtPeer = struct {
 
     /// Send multiple CHUNK_REQUESTs without waiting for responses (pipelining).
     /// Returns the request IDs assigned to each request.
-    pub fn sendChunkRequests(self: *BtPeer, chunk_hashes: []const [32]u8) ![]u32 {
+    pub fn sendChunkRequests(self: *BtPeer, chunk_hashes: []const [32]u8, range_starts: []const u32, range_ends: []const u32) ![]u32 {
         const ext_id = self.remote_xet_ext_id orelse return error.NoBepXetSupport;
 
         var sw = self.stream.writer(self.io, &self.write_buf);
@@ -189,7 +197,7 @@ pub const BtPeer = struct {
         for (chunk_hashes, 0..) |hash, i| {
             request_ids[i] = self.next_request_id;
             self.next_request_id += 1;
-            try bep_xet.encodeChunkRequest(writer, ext_id, request_ids[i], hash);
+            try bep_xet.encodeChunkRequest(writer, ext_id, request_ids[i], hash, range_starts[i], range_ends[i]);
         }
         try writer.flush();
         return request_ids;
@@ -197,7 +205,7 @@ pub const BtPeer = struct {
 
     /// Receive the next chunk response from the peer.
     /// Handles control messages inline while waiting.
-    /// Returns the request_id and data on success; returns
+    /// Returns the request_id and data+chunk_offset on success; returns
     /// ChunkNotFound/ChunkError when the peer rejects the request.
     pub fn receiveChunkResponse(self: *BtPeer) !ChunkResult {
         var sr = self.stream.reader(self.io, &self.read_buf);
@@ -225,7 +233,7 @@ pub const BtPeer = struct {
                 .chunk_response => |resp| {
                     return .{
                         .request_id = resp.request_id,
-                        .data = try self.allocator.dupe(u8, resp.data),
+                        .data = .{ .data = try self.allocator.dupe(u8, resp.data), .chunk_offset = resp.chunk_offset },
                     };
                 },
                 .chunk_not_found => |nf| {
@@ -241,8 +249,8 @@ pub const BtPeer = struct {
 
     pub const ChunkResult = struct {
         request_id: u32,
-        /// Chunk data on success, or an error describing why the peer rejected the request.
-        data: ChunkDataError![]u8,
+        /// Chunk fetch result on success, or an error describing why the peer rejected the request.
+        data: ChunkDataError!ChunkFetchResult,
     };
 
     pub const ChunkDataError = error{
@@ -283,11 +291,11 @@ pub const BtPeer = struct {
     }
 
     /// Send a chunk response to the peer.
-    pub fn sendChunkResponse(self: *BtPeer, request_id: u32, data: []const u8) !void {
+    pub fn sendChunkResponse(self: *BtPeer, request_id: u32, chunk_offset: u32, data: []const u8) !void {
         const ext_id = self.remote_xet_ext_id orelse return error.NoBepXetSupport;
         var sw = self.stream.writer(self.io, &self.write_buf);
         const writer = &sw.interface;
-        try bep_xet.encodeChunkResponse(writer, ext_id, request_id, data);
+        try bep_xet.encodeChunkResponse(writer, ext_id, request_id, chunk_offset, data);
         try writer.flush();
     }
 

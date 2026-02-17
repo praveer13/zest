@@ -43,7 +43,17 @@ pub const ReconstructionInfo = struct {
     }
 };
 
-/// Xorb local cache: stores xorbs by hash for reuse and seeding.
+/// Result of a range-aware cache or P2P lookup.
+pub const CacheResult = struct {
+    data: []u8,
+    chunk_offset: u32,
+};
+
+/// Xorb local cache: stores full and partial xorbs by hash for reuse and seeding.
+///
+/// Full xorbs are cached as `{hash_hex}`, partial entries as `{hash_hex}.{range_start}`.
+/// This enables range-aware P2P: the seeder caches every CDN-fetched entry,
+/// and receivers request specific ranges that the seeder can serve.
 pub const XorbCache = struct {
     cfg: *const config.Config,
     allocator: std.mem.Allocator,
@@ -63,7 +73,41 @@ pub const XorbCache = struct {
 
     /// Read a cached xorb from disk.
     pub fn get(self: *const XorbCache, hash_hex: []const u8) !?[]u8 {
-        const cache_path = try self.cfg.xorbCachePath(hash_hex);
+        return self.readFile(hash_hex);
+    }
+
+    /// Range-aware cache lookup. Tries full xorb first (`{hash_hex}`, offset=0),
+    /// then partial entry (`{hash_hex}.{range_start}`).
+    pub fn getWithRange(self: *const XorbCache, hash_hex: []const u8, range_start: u32) !?CacheResult {
+        // Try full xorb first
+        if (try self.readFile(hash_hex)) |data| {
+            return .{ .data = data, .chunk_offset = 0 };
+        }
+        // Try partial entry
+        if (range_start > 0) {
+            var key_buf: [64 + 1 + 10]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "{s}.{d}", .{ hash_hex, range_start }) catch return null;
+            if (try self.readFile(key)) |data| {
+                return .{ .data = data, .chunk_offset = range_start };
+            }
+        }
+        return null;
+    }
+
+    /// Write a complete xorb to the local cache.
+    pub fn put(self: *const XorbCache, hash_hex: []const u8, data: []const u8) !void {
+        try self.writeFile(hash_hex, data);
+    }
+
+    /// Write a partial xorb entry to the local cache as `{hash_hex}.{range_start}`.
+    pub fn putPartial(self: *const XorbCache, hash_hex: []const u8, range_start: u32, data: []const u8) !void {
+        var key_buf: [64 + 1 + 10]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}.{d}", .{ hash_hex, range_start }) catch return error.WriteFailed;
+        try self.writeFile(key, data);
+    }
+
+    fn readFile(self: *const XorbCache, key: []const u8) !?[]u8 {
+        const cache_path = try self.cfg.xorbCachePath(key);
         defer self.allocator.free(cache_path);
 
         const file = Io.Dir.openFileAbsolute(self.io, cache_path, .{}) catch return null;
@@ -87,9 +131,8 @@ pub const XorbCache = struct {
         return data;
     }
 
-    /// Write a xorb to the local cache.
-    pub fn put(self: *const XorbCache, hash_hex: []const u8, data: []const u8) !void {
-        const cache_path = try self.cfg.xorbCachePath(hash_hex);
+    fn writeFile(self: *const XorbCache, key: []const u8, data: []const u8) !void {
+        const cache_path = try self.cfg.xorbCachePath(key);
         defer self.allocator.free(cache_path);
 
         // Ensure parent directory exists
@@ -313,13 +356,13 @@ pub const SwarmDownloader = struct {
         self.discovery_time_ns = nowNs(self.io);
     }
 
-    /// Try to download a xorb via BT peers.
-    /// Returns the xorb data on success (caller owns the memory).
+    /// Try to download a xorb via BT peers (range-aware).
+    /// Returns the data + chunk_offset on success (caller owns the memory).
     /// Returns a typed error describing why P2P failed.
     /// Peers are discovered on first call and refreshed periodically (TTL).
     /// Thread-safe: PeerPool.mutex protects the connection map,
     /// BtPeer.mutex serializes per-peer TCP stream access.
-    pub fn tryBtPeerDownload(self: *SwarmDownloader, term: *const Term) PeerDownloadError![]u8 {
+    pub fn tryBtPeerDownload(self: *SwarmDownloader, term: *const Term) PeerDownloadError!CacheResult {
         if (!self.enable_p2p) return error.P2PDisabled;
 
         const info_hash = peer_id_mod.computeInfoHash(term.xorb_hash);
@@ -333,36 +376,36 @@ pub const SwarmDownloader = struct {
 
         // Try direct peers first, then cached discovered peers
         if (has_direct) {
-            if (self.tryPeersSequential(self.direct_peers.items, info_hash, term)) |data| return data;
+            if (self.tryPeersSequential(self.direct_peers.items, info_hash, term)) |result| return result;
         }
         if (has_cached) {
-            if (self.tryPeersSequential(self.cached_peers.items, info_hash, term)) |data| return data;
+            if (self.tryPeersSequential(self.cached_peers.items, info_hash, term)) |result| return result;
         }
         return error.AllPeersFailed;
     }
 
     /// Try downloading from multiple peers, using the connection pool.
-    /// Returns data on first success, null if all peers failed.
-    fn tryPeersSequential(self: *SwarmDownloader, addrs: []const net.IpAddress, info_hash: [20]u8, term: *const Term) ?[]u8 {
+    /// Returns CacheResult on first success, null if all peers failed.
+    fn tryPeersSequential(self: *SwarmDownloader, addrs: []const net.IpAddress, info_hash: [20]u8, term: *const Term) ?CacheResult {
         for (addrs) |address| {
-            if (self.tryPooledChunkDownload(address, info_hash, term)) |data| {
-                return data;
+            if (self.tryPooledChunkDownload(address, info_hash, term)) |result| {
+                return result;
             }
         }
         return null;
     }
 
     /// Try to download xorb data from a single BT peer, using the connection pool.
-    /// Returns the data on success (caller owns), null on failure.
-    fn tryPooledChunkDownload(self: *SwarmDownloader, address: net.IpAddress, info_hash: [20]u8, term: *const Term) ?[]u8 {
+    /// Returns CacheResult on success (caller owns data), null on failure.
+    fn tryPooledChunkDownload(self: *SwarmDownloader, address: net.IpAddress, info_hash: [20]u8, term: *const Term) ?CacheResult {
         const peer = self.peer_pool.getOrConnect(address, info_hash) catch return null;
 
         if (!peer.supports_xet) return null;
 
         self.stats.peers_connected += 1;
 
-        // Request the xorb chunk
-        const data = peer.requestChunk(term.xorb_hash) catch |err| {
+        // Request with chunk range
+        const fetch_result = peer.requestChunk(term.xorb_hash, term.chunk_range_start, term.chunk_range_end) catch |err| {
             // Connection error — remove from pool so next attempt reconnects
             switch (err) {
                 error.ChunkNotFound, error.ChunkError => {},
@@ -371,11 +414,15 @@ pub const SwarmDownloader = struct {
             return null;
         };
 
-        // Cache for seeding (best-effort, doesn't take ownership of data)
-        self.cache.put(&term.xorb_hash_hex, data) catch {};
+        // Cache for seeding (range-aware)
+        if (fetch_result.chunk_offset == 0) {
+            self.cache.put(&term.xorb_hash_hex, fetch_result.data) catch {};
+        } else {
+            self.cache.putPartial(&term.xorb_hash_hex, fetch_result.chunk_offset, fetch_result.data) catch {};
+        }
         self.stats.peer_xorbs += 1;
-        self.stats.peer_bytes += data.len;
-        self.stats.total_bytes += data.len;
+        self.stats.peer_bytes += fetch_result.data.len;
+        self.stats.total_bytes += fetch_result.data.len;
         self.stats.peer_chunks += 1;
 
         // Seed-while-downloading: register in xorb registry immediately
@@ -388,7 +435,7 @@ pub const SwarmDownloader = struct {
             d.announcePeer(info_hash, self.cfg.listen_port) catch {};
         }
 
-        return data;
+        return .{ .data = fetch_result.data, .chunk_offset = fetch_result.chunk_offset };
     }
 
     /// Simple HTTP download from a URL using fetch.

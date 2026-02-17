@@ -28,7 +28,7 @@ const http_api_mod = @import("http_api.zig");
 const xet_bridge_mod = @import("xet_bridge.zig");
 const parallel_dl = @import("parallel_download.zig");
 
-const version = "0.4.1";
+const version = "0.4.2";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

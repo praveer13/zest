@@ -178,30 +178,32 @@ pub const BtServer = struct {
         const xet_msg = bep_xet.decodeMessage(ext.data) catch return;
         switch (xet_msg) {
             .chunk_request => |req| {
-                try self.handleChunkRequest(writer, req.request_id, req.chunk_hash);
+                try self.handleChunkRequest(writer, req.request_id, req.chunk_hash, req.range_start, req.range_end);
             },
             .chunk_response, .chunk_not_found, .chunk_error => {},
         }
     }
 
-    fn handleChunkRequest(self: *BtServer, writer: *Io.Writer, request_id: u32, chunk_hash: [32]u8) !void {
+    fn handleChunkRequest(self: *BtServer, writer: *Io.Writer, request_id: u32, chunk_hash: [32]u8, range_start: u32, range_end: u32) !void {
+        _ = range_end; // Used for future filtering; lookup is by hash + range_start
+
         // Look up in chunk cache first
         const data = try storage.readChunk(self.allocator, self.io, self.cfg, chunk_hash);
         if (data) |chunk_data| {
             defer self.allocator.free(chunk_data);
-            try bep_xet.encodeChunkResponse(writer, 1, request_id, chunk_data);
+            try bep_xet.encodeChunkResponse(writer, 1, request_id, 0, chunk_data);
             try writer.flush();
             _ = self.chunks_served.fetchAdd(1, .monotonic);
             return;
         }
 
-        // Fall back to xorb cache (P2P requests xorbs by hash)
+        // Fall back to xorb cache (range-aware lookup)
         // Must use zig-xet's hashToHex (little-endian u64 encoding) to match
         // the cache keys written by xet_bridge.zig.
         const hex = xet.hashing.hashToHex(chunk_hash);
-        if (try self.xorb_cache.get(&hex)) |xorb_data| {
-            defer self.allocator.free(xorb_data);
-            try bep_xet.encodeChunkResponse(writer, 1, request_id, xorb_data);
+        if (try self.xorb_cache.getWithRange(&hex, range_start)) |result| {
+            defer self.allocator.free(result.data);
+            try bep_xet.encodeChunkResponse(writer, 1, request_id, result.chunk_offset, result.data);
             try writer.flush();
             _ = self.chunks_served.fetchAdd(1, .monotonic);
             return;

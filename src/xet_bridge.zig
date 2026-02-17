@@ -141,8 +141,11 @@ pub const XetBridge = struct {
         return error.NotAuthenticated;
     }
 
-    /// Fetch xorb data for a reconstruction term.
+    /// Fetch xorb data for a reconstruction term (range-aware).
     /// Waterfall: local cache → P2P swarm → CDN.
+    /// All three paths use the same matching FetchInfo entry for consistent
+    /// index rebasing. Every CDN-fetched entry is cached (full or partial)
+    /// so P2P peers can serve it — receivers never need CDN.
     pub fn fetchXorbForTerm(
         self: *XetBridge,
         term: cas_client.ReconstructionTerm,
@@ -150,59 +153,78 @@ pub const XetBridge = struct {
     ) !XorbFetchResult {
         const hash_hex = hashing.hashToHex(term.hash);
 
-        // Step 1: Check local xorb cache (full xorbs from P2P / previous downloads)
-        if (try self.cache.get(&hash_hex)) |cached_data| {
+        // Find the matching FetchInfo entry for this term's chunk range.
+        const all_entries = fetch_info_map.get(&hash_hex) orelse return error.NotAuthenticated;
+        const fi = findMatchingEntry(all_entries, term.range.start, term.range.end) orelse
+            return error.NoMatchingFetchInfo;
+
+        // Step 1: Check local xorb cache (range-aware: full xorb or partial entry)
+        if (try self.cache.getWithRange(&hash_hex, fi.range.start)) |cached| {
             self.stats.xorbs_from_cache += 1;
-            self.stats.bytes_from_cache += cached_data.len;
-            // Cache contains full xorb → use absolute chunk indices
+            self.stats.bytes_from_cache += cached.data.len;
             return .{
-                .data = cached_data,
-                .local_start = term.range.start,
-                .local_end = term.range.end,
+                .data = cached.data,
+                .local_start = term.range.start - cached.chunk_offset,
+                .local_end = term.range.end - cached.chunk_offset,
             };
         }
 
-        // Step 2: Try P2P first — data returned directly (no cache round-trip)
+        // Step 2: Try P2P (range-aware: request with fi's chunk range)
         if (self.swarm_downloader) |dl| {
             const swarm_term = swarm_mod.Term{
                 .xorb_hash = term.hash,
                 .xorb_hash_hex = hash_hex,
-                .chunk_range_start = term.range.start,
-                .chunk_range_end = term.range.end,
+                .chunk_range_start = fi.range.start,
+                .chunk_range_end = fi.range.end,
                 .url = null,
             };
-            if (dl.tryBtPeerDownload(&swarm_term)) |peer_data| {
+            if (dl.tryBtPeerDownload(&swarm_term)) |peer_result| {
                 self.stats.xorbs_from_peer += 1;
-                self.stats.bytes_from_peer += peer_data.len;
+                self.stats.bytes_from_peer += peer_result.data.len;
                 return .{
-                    .data = peer_data,
-                    .local_start = term.range.start,
-                    .local_end = term.range.end,
+                    .data = peer_result.data,
+                    .local_start = term.range.start - peer_result.chunk_offset,
+                    .local_end = term.range.end - peer_result.chunk_offset,
                 };
             } else |_| {
                 // P2P unavailable or all peers failed — fall through to CDN
             }
         }
 
-        // Step 3: CDN fallback
-        const fetch_info = findFetchInfo(&hash_hex, term.range, fetch_info_map);
-        if (fetch_info) |fi| {
-            if (self.cas) |*cas| {
-                const cdn_data = try cas.fetchXorbFromUrl(
-                    fi.url,
-                    .{ .start = fi.url_range.start, .end = fi.url_range.end },
-                );
-                const local_start = term.range.start - fi.range.start;
-                const local_end = term.range.end - fi.range.start;
-                self.stats.xorbs_from_cdn += 1;
-                self.stats.bytes_from_cdn += cdn_data.len;
-                // Cache for P2P seeding (best-effort)
+        // Step 3: CDN (seeder only — receivers get everything from P2P above)
+        if (self.cas) |*cas| {
+            const cdn_data = try cas.fetchXorbFromUrl(
+                fi.url,
+                .{ .start = fi.url_range.start, .end = fi.url_range.end },
+            );
+            self.stats.xorbs_from_cdn += 1;
+            self.stats.bytes_from_cdn += cdn_data.len;
+
+            // Cache every entry for P2P serving
+            if (fi.range.start == 0 and all_entries.len == 1) {
                 self.cache.put(&hash_hex, cdn_data) catch {};
-                return .{ .data = cdn_data, .local_start = local_start, .local_end = local_end };
+            } else {
+                self.cache.putPartial(&hash_hex, fi.range.start, cdn_data) catch {};
             }
+
+            return .{
+                .data = cdn_data,
+                .local_start = term.range.start - fi.range.start,
+                .local_end = term.range.end - fi.range.start,
+            };
         }
 
         return error.NotAuthenticated;
+    }
+
+    /// Find the FetchInfo entry that covers the given chunk range.
+    fn findMatchingEntry(entries: []cas_client.FetchInfo, range_start: u32, range_end: u32) ?cas_client.FetchInfo {
+        for (entries) |fi| {
+            if (fi.range.start <= range_start and fi.range.end >= range_end) {
+                return fi;
+            }
+        }
+        return null;
     }
 
     /// Reconstruct a file from its xet hash and write to output path.
@@ -258,21 +280,6 @@ pub const XetBridge = struct {
         }
     }
 };
-
-/// Find the FetchInfo entry that covers a term's chunk range.
-fn findFetchInfo(
-    hash_hex: []const u8,
-    range: cas_client.ChunkRange,
-    fetch_info_map: std.StringHashMap([]cas_client.FetchInfo),
-) ?cas_client.FetchInfo {
-    const fetch_infos = fetch_info_map.get(hash_hex) orelse return null;
-    for (fetch_infos) |fi| {
-        if (fi.range.start <= range.start and fi.range.end >= range.end) {
-            return fi;
-        }
-    }
-    return null;
-}
 
 // ── Tests ──
 

@@ -4,7 +4,7 @@
 
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
 [![Tests](https://img.shields.io/badge/tests-72%20passing-brightgreen)](#testing)
-[![License](https://img.shields.io/badge/license-MIT-blue)](#license)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Lines of Code](https://img.shields.io/badge/lines-5%2C644-informational)](#project-structure)
 
 zest speaks HuggingFace's [Xet protocol](https://huggingface.co/docs/xet/index) (via [zig-xet](https://github.com/jedisct1/zig-xet)) for content addressing and [BitTorrent](https://www.bittorrent.org/beps/bep_0003.html) (BEP 3 / BEP 10 / [BEP XET](https://ccbittorrent.readthedocs.io/en/latest/bep_xet/)) for peer-to-peer transfer. Models download from nearby peers first, fall back to HF's CDN.
@@ -376,4 +376,4 @@ See [DESIGN.md](DESIGN.md) for the full design document with architecture, BEP X
 
 ## License
 
-MIT
+[Apache License 2.0](LICENSE)
