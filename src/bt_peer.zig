@@ -197,6 +197,8 @@ pub const BtPeer = struct {
 
     /// Receive the next chunk response from the peer.
     /// Handles control messages inline while waiting.
+    /// Returns the request_id and data on success; returns
+    /// ChunkNotFound/ChunkError when the peer rejects the request.
     pub fn receiveChunkResponse(self: *BtPeer) !ChunkResult {
         var sr = self.stream.reader(self.io, &self.read_buf);
         const reader = &sr.interface;
@@ -227,10 +229,10 @@ pub const BtPeer = struct {
                     };
                 },
                 .chunk_not_found => |nf| {
-                    return .{ .request_id = nf.request_id, .data = null };
+                    return .{ .request_id = nf.request_id, .data = error.ChunkNotFound };
                 },
                 .chunk_error => |ce| {
-                    return .{ .request_id = ce.request_id, .data = null };
+                    return .{ .request_id = ce.request_id, .data = error.ChunkError };
                 },
                 .chunk_request => {},
             }
@@ -239,7 +241,13 @@ pub const BtPeer = struct {
 
     pub const ChunkResult = struct {
         request_id: u32,
-        data: ?[]u8,
+        /// Chunk data on success, or an error describing why the peer rejected the request.
+        data: ChunkDataError![]u8,
+    };
+
+    pub const ChunkDataError = error{
+        ChunkNotFound,
+        ChunkError,
     };
 
     /// Handle an incoming message (for seeding). Returns the parsed XET message

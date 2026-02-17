@@ -121,6 +121,23 @@ pub const DownloadStats = struct {
     dht_lookups: usize,
 };
 
+/// Monotonic clock nanoseconds (u64).
+fn nowNs(io: Io) u64 {
+    const ts = Io.Clock.awake.now(io);
+    const ns: i96 = ts.nanoseconds;
+    if (ns < 0) return 0;
+    return @intCast(@min(ns, std.math.maxInt(u64)));
+}
+
+pub const PeerDownloadError = error{
+    /// No peers available (none discovered, none configured via --peer).
+    NoPeersAvailable,
+    /// Peers exist but all failed (connection errors, chunk not found, etc.).
+    AllPeersFailed,
+    /// P2P is disabled in this session.
+    P2PDisabled,
+};
+
 pub const SwarmDownloader = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -139,6 +156,14 @@ pub const SwarmDownloader = struct {
     xorb_registry: ?*storage.XorbRegistry,
     // Direct peers specified via --peer flag (tried before DHT/tracker)
     direct_peers: std.ArrayList(net.IpAddress),
+    // Cached peer addresses from DHT/tracker, refreshed periodically
+    cached_peers: std.ArrayList(net.IpAddress),
+    peers_discovered: bool,
+    discovery_mutex: Io.Mutex,
+    /// Monotonic timestamp (ns) of last peer discovery.
+    discovery_time_ns: u64,
+    /// How often to re-query DHT/tracker for new peers (default 30s).
+    discovery_ttl_ns: u64,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -179,6 +204,11 @@ pub const SwarmDownloader = struct {
             .peer_pool = peer_pool_mod.PeerPool.init(allocator, io, cfg_ptr.peer_id, cfg_ptr.listen_port, cfg_ptr.max_peers),
             .xorb_registry = null,
             .direct_peers = .empty,
+            .cached_peers = .empty,
+            .peers_discovered = false,
+            .discovery_mutex = Io.Mutex.init,
+            .discovery_time_ns = 0,
+            .discovery_ttl_ns = 30 * @as(u64, std.time.ns_per_s),
         };
     }
 
@@ -193,6 +223,7 @@ pub const SwarmDownloader = struct {
         if (self.bt_tracker) |*t| t.deinit();
         self.peer_pool.deinit();
         self.direct_peers.deinit(self.allocator);
+        self.cached_peers.deinit(self.allocator);
     }
 
     /// Download all xorbs needed for a file's reconstruction.
@@ -215,8 +246,11 @@ pub const SwarmDownloader = struct {
 
         // Step 2: Try P2P via BT protocol
         if (self.enable_p2p) {
-            if (self.tryBtPeerDownload(term)) {
+            if (self.tryBtPeerDownload(term)) |data| {
+                self.allocator.free(data);
                 return;
+            } else |_| {
+                // P2P failed — fall through to CDN
             }
         }
 
@@ -238,64 +272,92 @@ pub const SwarmDownloader = struct {
         }
     }
 
-    /// Try to download a xorb via BT peers (DHT + tracker discovery).
-    /// Uses connection pool to reuse existing connections.
-    /// Returns true if the xorb was downloaded and cached successfully.
-    /// Thread-safe: PeerPool.mutex protects the connection map,
-    /// BtPeer.mutex serializes per-peer TCP stream access.
-    pub fn tryBtPeerDownload(self: *SwarmDownloader, term: *const Term) bool {
-        const info_hash = peer_id_mod.computeInfoHash(term.xorb_hash);
+    /// Discover peers via DHT and BT tracker. On first call, populates the
+    /// cache. On subsequent calls, re-queries if the TTL has elapsed so new
+    /// peers that joined the swarm are picked up. Thread-safe via
+    /// discovery_mutex.
+    fn discoverPeers(self: *SwarmDownloader, info_hash: [20]u8) void {
+        self.discovery_mutex.lockUncancelable(self.io);
+        defer self.discovery_mutex.unlock(self.io);
 
-        // Collect peer addresses from all discovery sources
-        var peer_addrs: std.ArrayList(net.IpAddress) = .empty;
-        defer peer_addrs.deinit(self.allocator);
-
-        // Direct peers first (from --peer flag)
-        for (self.direct_peers.items) |addr| {
-            peer_addrs.append(self.allocator, addr) catch {};
+        // Skip re-discovery if TTL hasn't elapsed yet.
+        if (self.peers_discovered) {
+            const now = nowNs(self.io);
+            if ((now - self.discovery_time_ns) < self.discovery_ttl_ns) return;
+            // TTL expired — clear stale list and re-discover.
+            self.cached_peers.clearRetainingCapacity();
         }
 
-        // Discover peers via DHT
         if (self.dht_client) |*d| {
             self.stats.dht_lookups += 1;
             const peers = d.getPeers(info_hash) catch &[_]dht_mod.CompactPeer{};
             defer if (peers.len > 0) self.allocator.free(peers);
-
             for (peers) |peer| {
-                peer_addrs.append(self.allocator, peer.address) catch {};
+                self.cached_peers.append(self.allocator, peer.address) catch {};
             }
         }
 
-        // Discover peers via BT tracker
         if (self.bt_tracker) |*t| {
             const resp = t.announce(info_hash, self.cfg.listen_port, .started) catch {
-                return self.tryPeersSequential(peer_addrs.items, info_hash, term);
+                self.peers_discovered = true;
+                self.discovery_time_ns = nowNs(self.io);
+                return;
             };
             defer @constCast(&resp).deinit();
-
             for (resp.peers) |peer| {
-                peer_addrs.append(self.allocator, peer.address) catch {};
+                self.cached_peers.append(self.allocator, peer.address) catch {};
             }
         }
 
-        return self.tryPeersSequential(peer_addrs.items, info_hash, term);
+        self.peers_discovered = true;
+        self.discovery_time_ns = nowNs(self.io);
+    }
+
+    /// Try to download a xorb via BT peers.
+    /// Returns the xorb data on success (caller owns the memory).
+    /// Returns a typed error describing why P2P failed.
+    /// Peers are discovered on first call and refreshed periodically (TTL).
+    /// Thread-safe: PeerPool.mutex protects the connection map,
+    /// BtPeer.mutex serializes per-peer TCP stream access.
+    pub fn tryBtPeerDownload(self: *SwarmDownloader, term: *const Term) PeerDownloadError![]u8 {
+        if (!self.enable_p2p) return error.P2PDisabled;
+
+        const info_hash = peer_id_mod.computeInfoHash(term.xorb_hash);
+
+        // Discover/refresh peers (TTL-gated)
+        self.discoverPeers(info_hash);
+
+        const has_direct = self.direct_peers.items.len > 0;
+        const has_cached = self.cached_peers.items.len > 0;
+        if (!has_direct and !has_cached) return error.NoPeersAvailable;
+
+        // Try direct peers first, then cached discovered peers
+        if (has_direct) {
+            if (self.tryPeersSequential(self.direct_peers.items, info_hash, term)) |data| return data;
+        }
+        if (has_cached) {
+            if (self.tryPeersSequential(self.cached_peers.items, info_hash, term)) |data| return data;
+        }
+        return error.AllPeersFailed;
     }
 
     /// Try downloading from multiple peers, using the connection pool.
-    fn tryPeersSequential(self: *SwarmDownloader, addrs: []const net.IpAddress, info_hash: [20]u8, term: *const Term) bool {
+    /// Returns data on first success, null if all peers failed.
+    fn tryPeersSequential(self: *SwarmDownloader, addrs: []const net.IpAddress, info_hash: [20]u8, term: *const Term) ?[]u8 {
         for (addrs) |address| {
-            if (self.tryPooledChunkDownload(address, info_hash, term)) {
-                return true;
+            if (self.tryPooledChunkDownload(address, info_hash, term)) |data| {
+                return data;
             }
         }
-        return false;
+        return null;
     }
 
     /// Try to download xorb data from a single BT peer, using the connection pool.
-    fn tryPooledChunkDownload(self: *SwarmDownloader, address: net.IpAddress, info_hash: [20]u8, term: *const Term) bool {
-        const peer = self.peer_pool.getOrConnect(address, info_hash) catch return false;
+    /// Returns the data on success (caller owns), null on failure.
+    fn tryPooledChunkDownload(self: *SwarmDownloader, address: net.IpAddress, info_hash: [20]u8, term: *const Term) ?[]u8 {
+        const peer = self.peer_pool.getOrConnect(address, info_hash) catch return null;
 
-        if (!peer.supports_xet) return false;
+        if (!peer.supports_xet) return null;
 
         self.stats.peers_connected += 1;
 
@@ -306,11 +368,10 @@ pub const SwarmDownloader = struct {
                 error.ChunkNotFound, error.ChunkError => {},
                 else => self.peer_pool.remove(address),
             }
-            return false;
+            return null;
         };
-        defer self.allocator.free(data);
 
-        // Cache and record stats
+        // Cache for seeding (best-effort, doesn't take ownership of data)
         self.cache.put(&term.xorb_hash_hex, data) catch {};
         self.stats.peer_xorbs += 1;
         self.stats.peer_bytes += data.len;
@@ -327,7 +388,7 @@ pub const SwarmDownloader = struct {
             d.announcePeer(info_hash, self.cfg.listen_port) catch {};
         }
 
-        return true;
+        return data;
     }
 
     /// Simple HTTP download from a URL using fetch.

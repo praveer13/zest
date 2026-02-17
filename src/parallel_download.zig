@@ -110,10 +110,14 @@ pub const ParallelDownloader = struct {
         var file_buf: [8192]u8 = undefined;
         var fw = file.writer(self.io, &file_buf);
 
-        // Process terms in batches — each task uses bridge (cache → P2P → CDN)
+        // Process terms in large batches to minimize sync stalls at boundaries.
+        // Io.Group limits actual concurrency; per-peer mutexes serialize TCP access.
+        // Tasks that exceed the concurrency limit fall back to synchronous execution
+        // but still benefit from cooperative I/O scheduling.
+        const batch_cap = @min(recon.terms.len, @as(usize, self.max_concurrent) * 8);
         var batch_start: usize = 0;
         while (batch_start < recon.terms.len) {
-            const batch_end = @min(batch_start + self.max_concurrent, recon.terms.len);
+            const batch_end = @min(batch_start + batch_cap, recon.terms.len);
             const batch_size = batch_end - batch_start;
 
             try self.processBatch(

@@ -162,29 +162,25 @@ pub const XetBridge = struct {
             };
         }
 
-        // Step 2: Try P2P first (sequential to avoid nested Io.Group deadlock
-        // with the parallel downloader's outer Io.Group)
-        const can_p2p = if (self.swarm_downloader) |dl| dl.enable_p2p else false;
-        if (can_p2p) {
-            if (self.swarm_downloader) |dl| {
-                const swarm_term = swarm_mod.Term{
-                    .xorb_hash = term.hash,
-                    .xorb_hash_hex = hash_hex,
-                    .chunk_range_start = term.range.start,
-                    .chunk_range_end = term.range.end,
-                    .url = null,
+        // Step 2: Try P2P first — data returned directly (no cache round-trip)
+        if (self.swarm_downloader) |dl| {
+            const swarm_term = swarm_mod.Term{
+                .xorb_hash = term.hash,
+                .xorb_hash_hex = hash_hex,
+                .chunk_range_start = term.range.start,
+                .chunk_range_end = term.range.end,
+                .url = null,
+            };
+            if (dl.tryBtPeerDownload(&swarm_term)) |peer_data| {
+                self.stats.xorbs_from_peer += 1;
+                self.stats.bytes_from_peer += peer_data.len;
+                return .{
+                    .data = peer_data,
+                    .local_start = term.range.start,
+                    .local_end = term.range.end,
                 };
-                if (dl.tryBtPeerDownload(&swarm_term)) {
-                    if (try self.cache.get(&hash_hex)) |peer_data| {
-                        self.stats.xorbs_from_peer += 1;
-                        self.stats.bytes_from_peer += peer_data.len;
-                        return .{
-                            .data = peer_data,
-                            .local_start = term.range.start,
-                            .local_end = term.range.end,
-                        };
-                    }
-                }
+            } else |_| {
+                // P2P unavailable or all peers failed — fall through to CDN
             }
         }
 

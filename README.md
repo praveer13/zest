@@ -5,7 +5,7 @@
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
 [![Tests](https://img.shields.io/badge/tests-72%20passing-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
-[![Lines of Code](https://img.shields.io/badge/lines-5%2C548-informational)](#project-structure)
+[![Lines of Code](https://img.shields.io/badge/lines-5%2C644-informational)](#project-structure)
 
 zest speaks HuggingFace's [Xet protocol](https://huggingface.co/docs/xet/index) (via [zig-xet](https://github.com/jedisct1/zig-xet)) for content addressing and [BitTorrent](https://www.bittorrent.org/beps/bep_0003.html) (BEP 3 / BEP 10 / [BEP XET](https://ccbittorrent.readthedocs.io/en/latest/bep_xet/)) for peer-to-peer transfer. Models download from nearby peers first, fall back to HF's CDN.
 
@@ -256,6 +256,8 @@ This means zest peers can interoperate with any BEP XET-compliant client, includ
 - **HF cache compatible** — writes to `~/.cache/huggingface/hub/` so all existing tooling works.
 - **64KB chunks** — matches HuggingFace Xet's CDC parameters for content-level interop.
 - **Connection pooling** — persistent BT connections reused across xorb downloads.
+- **Cached peer discovery** — DHT/tracker queried once, reused for all xorbs (30s TTL refresh).
+- **Direct P2P data return** — P2P data used immediately, no disk cache round-trip.
 - **Seed-while-downloading** — newly downloaded xorbs are immediately available for serving to other peers.
 
 ## Project Structure
@@ -360,7 +362,8 @@ zig build test --summary all
 - [x] **Phase 3: Transfer Optimizations** — connection pooling, request pipelining, seed-while-downloading
 - [x] **Phase 4: Python Package** — `pip install zest`, HF backend hook, auto-enable via `ZEST=1`
 - [x] **Phase 5: XET Bridge + Parallel Downloads** — xorb-level cache→P2P→CDN waterfall, 16x concurrent downloads, thread-safe peer pool
-- [ ] **Phase 6: Ecosystem** — vLLM, Ollama, llama.cpp integrations
+- [x] **Phase 6: P2P Optimizations** — cached peer discovery (30s TTL), direct P2P data return (no cache round-trip), larger batch depth, typed P2P errors
+- [ ] **Phase 7: Ecosystem** — vLLM, Ollama, llama.cpp integrations
 
 See [DESIGN.md](DESIGN.md) for the full design document with architecture, BEP XET compliance details, and UX plans.
 
