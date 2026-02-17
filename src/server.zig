@@ -9,6 +9,7 @@
 const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
+const xet = @import("xet");
 const config = @import("config.zig");
 const storage = @import("storage.zig");
 const swarm_mod = @import("swarm.zig");
@@ -195,7 +196,9 @@ pub const BtServer = struct {
         }
 
         // Fall back to xorb cache (P2P requests xorbs by hash)
-        const hex = storage.hashToHex(chunk_hash);
+        // Must use zig-xet's hashToHex (little-endian u64 encoding) to match
+        // the cache keys written by xet_bridge.zig.
+        const hex = xet.hashing.hashToHex(chunk_hash);
         if (try self.xorb_cache.get(&hex)) |xorb_data| {
             defer self.allocator.free(xorb_data);
             try bep_xet.encodeChunkResponse(writer, 1, request_id, xorb_data);
