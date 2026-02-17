@@ -75,20 +75,20 @@ zest/
     ├── peer_id.zig        BT peer ID + SHA-1 info_hash (63 lines, 5 tests)
     ├── bt_wire.zig        BT wire protocol, BEP 3+10 (274 lines, 8 tests)
     ├── bep_xet.zig        BEP XET extension messages (349 lines, 6 tests)
-    ├── bt_peer.zig        BT peer lifecycle + state machine (322 lines, 3 tests)
+    ├── bt_peer.zig        BT peer lifecycle + state machine (338 lines, 3 tests)
     ├── peer_pool.zig      Connection pool for BT peer reuse (132 lines, 2 tests)
     ├── dht.zig            Kademlia DHT, BEP 5 (671 lines, 11 tests)
     ├── bt_tracker.zig     BT HTTP tracker client (260 lines, 5 tests)
-    ├── xet_bridge.zig     Bridges zig-xet CAS with P2P swarm (304 lines, 2 tests)
-    ├── parallel_download.zig  Concurrent xorb fetching (226 lines, 2 tests)
-    ├── swarm.zig          Download orchestrator (386 lines)
+    ├── xet_bridge.zig     Bridges zig-xet CAS with P2P swarm (300 lines, 2 tests)
+    ├── parallel_download.zig  Concurrent xorb fetching (230 lines, 2 tests)
+    ├── swarm.zig          Download orchestrator (441 lines)
     ├── storage.zig        File I/O, xorb/chunk cache (228 lines)
     ├── server.zig         BT TCP listener + concurrent peers (255 lines, 3 tests)
     ├── http_api.zig       HTTP REST API for Python integration (375 lines)
     └── bench.zig          Synthetic benchmarks + JSON (311 lines, 2 tests)
 ```
 
-**18 source files, ~5,548 lines, 72 tests.**
+**18 source files, ~5,644 lines, 72 tests.**
 
 ## BEP XET Protocol
 
@@ -100,7 +100,7 @@ zest is compliant with the [BEP XET specification](https://ccbittorrent.readthed
 - **CHUNK_NOT_FOUND** (0x03): 37 bytes — [type][request_id BE][chunk_hash]
 - **CHUNK_ERROR** (0x04): 9+N bytes — [type][request_id BE][error_code BE][message]
 - **info_hash**: `SHA-1("zest-xet-v1:" || xorb_hash_32bytes)` — per-xorb swarm granularity
-- **Peer ID**: Azureus-style `-ZE0400-` + 12 random bytes
+- **Peer ID**: Azureus-style `-ZE0401-` + 12 random bytes
 - **Chunk size**: 64KB target (matches HF Xet, not BEP XET default 16KB)
 - **Hash algorithm**: BLAKE3-256 for chunk verification
 
@@ -189,7 +189,7 @@ try list.append(allocator, item);
 ```bash
 zig build                              # Build (debug)
 zig build -Doptimize=ReleaseFast       # Build (release, ~7 MB binary)
-zig build test --summary all           # Run all 58 tests
+zig build test --summary all           # Run all 72 tests
 zig fmt --check src/                   # Check formatting
 ./zig-out/bin/zest pull <repo>         # Download a model
 ./zig-out/bin/zest seed --tracker <url> # Seed cached xorbs
@@ -208,7 +208,7 @@ zig fmt --check src/                   # Check formatting
 
 ## Next Tasks
 
-1. **Server mode** — REST API on localhost:9847 for Python integration (`zest serve`)
-2. **TCP listener** — accept incoming BT peer connections for seeding
-3. **Python package** — `pip install zest` with bundled Zig binary
-4. **Transfer optimizations** — chunk pipelining, multi-peer concurrent, reciprocity
+1. **RangeOutOfBounds investigation** — 2/69 xorbs hit this error in P2P transfer (graceful CDN fallback works)
+2. **Ecosystem integrations** — vLLM, Ollama, llama.cpp download backends
+3. **QUIC transport** — replace TCP with QUIC for multiplexed streams + NAT traversal
+4. **Peer exchange (PEX)** — share peer lists between connected peers
