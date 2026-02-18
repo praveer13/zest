@@ -32,10 +32,13 @@ pub const XetMessage = union(enum) {
 pub const ChunkRequest = struct {
     request_id: u32,
     chunk_hash: [32]u8,
+    range_start: u32,
+    range_end: u32,
 };
 
 pub const ChunkResponse = struct {
     request_id: u32,
+    chunk_offset: u32,
     data: []const u8,
 };
 
@@ -59,20 +62,22 @@ pub const ExtCapabilities = struct {
 // ── Encoding ──
 
 /// Encode a CHUNK_REQUEST as a BEP XET extension sub-payload.
-/// Format: [1 xet_type][4 request_id BE][32 chunk_hash] = 37 bytes
-pub fn encodeChunkRequest(writer: *Io.Writer, ext_id: u8, request_id: u32, chunk_hash: [32]u8) !void {
-    var payload: [37]u8 = undefined;
+/// Format: [1 xet_type][4 request_id BE][32 chunk_hash][4 range_start BE][4 range_end BE] = 45 bytes
+pub fn encodeChunkRequest(writer: *Io.Writer, ext_id: u8, request_id: u32, chunk_hash: [32]u8, range_start: u32, range_end: u32) !void {
+    var payload: [45]u8 = undefined;
     payload[0] = @intFromEnum(XetMessageType.chunk_request);
     std.mem.writeInt(u32, payload[1..5], request_id, .big);
     @memcpy(payload[5..37], &chunk_hash);
+    std.mem.writeInt(u32, payload[37..41], range_start, .big);
+    std.mem.writeInt(u32, payload[41..45], range_end, .big);
     try bt_wire.writeExtended(writer, ext_id, &payload);
 }
 
 /// Encode a CHUNK_RESPONSE as a BEP XET extension sub-payload.
-/// Format: [1 xet_type][4 request_id BE][4 data_len BE][N data]
-pub fn encodeChunkResponse(writer: *Io.Writer, ext_id: u8, request_id: u32, data: []const u8) !void {
+/// Format: [1 xet_type][4 request_id BE][4 chunk_offset BE][4 data_len BE][N data]
+pub fn encodeChunkResponse(writer: *Io.Writer, ext_id: u8, request_id: u32, chunk_offset: u32, data: []const u8) !void {
     // Write header via extended
-    const header_len = 1 + 4 + 4 + data.len;
+    const header_len = 1 + 4 + 4 + 4 + data.len;
     const total_len: u32 = @intCast(2 + header_len); // msg_id + ext_id + payload
     var header: [6]u8 = undefined;
     std.mem.writeInt(u32, header[0..4], total_len, .big);
@@ -80,10 +85,11 @@ pub fn encodeChunkResponse(writer: *Io.Writer, ext_id: u8, request_id: u32, data
     header[5] = ext_id;
     try writer.writeAll(&header);
 
-    var sub_header: [9]u8 = undefined;
+    var sub_header: [13]u8 = undefined;
     sub_header[0] = @intFromEnum(XetMessageType.chunk_response);
     std.mem.writeInt(u32, sub_header[1..5], request_id, .big);
-    std.mem.writeInt(u32, sub_header[5..9], @intCast(data.len), .big);
+    std.mem.writeInt(u32, sub_header[5..9], chunk_offset, .big);
+    std.mem.writeInt(u32, sub_header[9..13], @intCast(data.len), .big);
     try writer.writeAll(&sub_header);
     try writer.writeAll(data);
 }
@@ -128,20 +134,24 @@ pub fn decodeMessage(data: []const u8) !XetMessage {
 
     return switch (xet_type) {
         .chunk_request => {
-            if (rest.len < 36) return error.UnexpectedEnd;
+            if (rest.len < 44) return error.UnexpectedEnd;
             return .{ .chunk_request = .{
                 .request_id = std.mem.readInt(u32, rest[0..4], .big),
                 .chunk_hash = rest[4..36].*,
+                .range_start = std.mem.readInt(u32, rest[36..40], .big),
+                .range_end = std.mem.readInt(u32, rest[40..44], .big),
             } };
         },
         .chunk_response => {
-            if (rest.len < 8) return error.UnexpectedEnd;
+            if (rest.len < 12) return error.UnexpectedEnd;
             const request_id = std.mem.readInt(u32, rest[0..4], .big);
-            const data_len = std.mem.readInt(u32, rest[4..8], .big);
-            if (rest.len < 8 + data_len) return error.UnexpectedEnd;
+            const chunk_offset = std.mem.readInt(u32, rest[4..8], .big);
+            const data_len = std.mem.readInt(u32, rest[8..12], .big);
+            if (rest.len < 12 + data_len) return error.UnexpectedEnd;
             return .{ .chunk_response = .{
                 .request_id = request_id,
-                .data = rest[8 .. 8 + data_len],
+                .chunk_offset = chunk_offset,
+                .data = rest[12 .. 12 + data_len],
             } };
         },
         .chunk_not_found => {
@@ -178,7 +188,7 @@ pub fn makeExtHandshakePayload(allocator: std.mem.Allocator, listen_port: u16) !
     defer allocator.free(outer_entries);
     outer_entries[0] = .{ .key = "m", .value = .{ .dict = inner_entries } };
     outer_entries[1] = .{ .key = "p", .value = .{ .integer = @intCast(listen_port) } };
-    outer_entries[2] = .{ .key = "v", .value = .{ .string = "zest/0.2" } };
+    outer_entries[2] = .{ .key = "v", .value = .{ .string = "zest/0.3" } };
 
     return try bencode.encode(allocator, .{ .dict = outer_entries });
 }
@@ -232,7 +242,7 @@ test "chunk_request encode and decode" {
 
     var buf: [256]u8 = undefined;
     var writer: Io.Writer = .fixed(&buf);
-    try encodeChunkRequest(&writer, 1, 42, hash);
+    try encodeChunkRequest(&writer, 1, 42, hash, 10, 20);
 
     // Read back via bt_wire
     var reader: Io.Reader = .fixed(writer.buffered());
@@ -248,6 +258,8 @@ test "chunk_request encode and decode" {
         .chunk_request => |req| {
             try std.testing.expectEqual(@as(u32, 42), req.request_id);
             try std.testing.expectEqualSlices(u8, &hash, &req.chunk_hash);
+            try std.testing.expectEqual(@as(u32, 10), req.range_start);
+            try std.testing.expectEqual(@as(u32, 20), req.range_end);
         },
         else => return error.InvalidFormat,
     }
@@ -258,7 +270,7 @@ test "chunk_response encode and decode" {
 
     var buf: [4096]u8 = undefined;
     var writer: Io.Writer = .fixed(&buf);
-    try encodeChunkResponse(&writer, 2, 99, chunk_data);
+    try encodeChunkResponse(&writer, 2, 99, 42, chunk_data);
 
     var reader: Io.Reader = .fixed(writer.buffered());
     const msg = (try bt_wire.readMessage(&reader, std.testing.allocator)) orelse return error.InvalidFormat;
@@ -269,6 +281,7 @@ test "chunk_response encode and decode" {
     switch (xet_msg) {
         .chunk_response => |resp| {
             try std.testing.expectEqual(@as(u32, 99), resp.request_id);
+            try std.testing.expectEqual(@as(u32, 42), resp.chunk_offset);
             try std.testing.expectEqualSlices(u8, chunk_data, resp.data);
         },
         else => return error.InvalidFormat,
@@ -345,5 +358,5 @@ test "extended handshake parsing" {
     const caps = try parseExtHandshake(alloc, payload);
     try std.testing.expectEqual(@as(u8, 1), caps.ut_xet_id.?);
     try std.testing.expectEqual(@as(u16, 8080), caps.listen_port.?);
-    try std.testing.expectEqualSlices(u8, "zest/0.2", caps.client.?);
+    try std.testing.expectEqualSlices(u8, "zest/0.3", caps.client.?);
 }
