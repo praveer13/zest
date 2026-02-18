@@ -59,4 +59,15 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // Integration tests (shell scripts, depend on install so binary is built first)
+    const verify_model = b.addSystemCommand(&.{"./test/local/verify-model.sh"});
+    verify_model.step.dependOn(b.getInstallStep());
+    const verify_step = b.step("integration-test", "Pull model with zest, load with transformers, verify inference");
+    verify_step.dependOn(&verify_model.step);
+
+    const p2p_docker = b.addSystemCommand(&.{"./test/local/p2p-docker-test.sh"});
+    p2p_docker.step.dependOn(b.getInstallStep());
+    const p2p_step = b.step("p2p-test", "Docker-based P2P test (seeder + leecher, requires docker)");
+    p2p_step.dependOn(&p2p_docker.step);
 }
