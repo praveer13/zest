@@ -83,13 +83,11 @@ pub const XorbCache = struct {
         if (try self.readFile(hash_hex)) |data| {
             return .{ .data = data, .chunk_offset = 0 };
         }
-        // Try partial entry
-        if (range_start > 0) {
-            var key_buf: [64 + 1 + 10]u8 = undefined;
-            const key = std.fmt.bufPrint(&key_buf, "{s}.{d}", .{ hash_hex, range_start }) catch return null;
-            if (try self.readFile(key)) |data| {
-                return .{ .data = data, .chunk_offset = range_start };
-            }
+        // Try partial entry (including range_start == 0 for split xorbs)
+        var key_buf: [64 + 1 + 10]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}.{d}", .{ hash_hex, range_start }) catch return null;
+        if (try self.readFile(key)) |data| {
+            return .{ .data = data, .chunk_offset = range_start };
         }
         return null;
     }

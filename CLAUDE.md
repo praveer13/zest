@@ -95,8 +95,8 @@ zest/
 zest is compliant with the [BEP XET specification](https://ccbittorrent.readthedocs.io/en/latest/bep_xet/). Key details:
 
 - **Wire format**: BEP 10 extension messages (msg_id=20), 4 XET message types
-- **CHUNK_REQUEST** (0x01): 37 bytes — [type][request_id BE][chunk_hash BLAKE3-256]
-- **CHUNK_RESPONSE** (0x02): 9+N bytes — [type][request_id BE][data_len BE][data]
+- **CHUNK_REQUEST** (0x01): 45 bytes — [type][request_id BE][chunk_hash BLAKE3-256][range_start BE][range_end BE]
+- **CHUNK_RESPONSE** (0x02): 13+N bytes — [type][request_id BE][chunk_offset BE][data_len BE][data]
 - **CHUNK_NOT_FOUND** (0x03): 37 bytes — [type][request_id BE][chunk_hash]
 - **CHUNK_ERROR** (0x04): 9+N bytes — [type][request_id BE][error_code BE][message]
 - **info_hash**: `SHA-1("zest-xet-v1:" || xorb_hash_32bytes)` — per-xorb swarm granularity
